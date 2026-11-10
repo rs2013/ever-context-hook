@@ -1,0 +1,268 @@
+//! 会话寻址与消息身份（EC 代理版的核心算法）。
+//!
+//! ## 设计要点（对齐 `双上下文持久化与召回设计.md`）
+//!
+//! - **会话 ID** = 首条 user 全文的 SHA-256 截断（16 hex）。不信任下游传来的任何 ID。
+//! - **message_id** = SHA-256(feature_text + parent_id) 截断（16 hex）。
+//!   parent_id 纳入哈希，从根上消除"重复内容碰撞"（如连续两个 "继续"）。
+//! - **feature_text** = 按角色拼接的规范化文本，是哈希的内容来源。
+//! - 树状分叉：每个消息的 parent_id 指向前一条消息的 message_id。
+//!
+//! ## 与 BC 的差异
+//!
+//! BC 的 `deriveMessageId` 哈希 `role|contentType|toolCallId|toolName|text`（不含 parent），
+//! 重复内容靠实例重编号（_1/_2）解决。EC 把 parent_id 纳入哈希，更简单且天然支持树。
+
+use crate::ec::types::{ChatMessage, MessageRecord};
+use sha2::{Digest, Sha256};
+
+/// 会话 ID 的 hex 截断长度。
+pub const SESSION_ID_HEX: usize = 16;
+/// message_id 的 hex 截断长度。
+pub const MESSAGE_ID_HEX: usize = 16;
+
+/// 计算会话 ID = 首条 user 全文的 SHA-256 截断。
+///
+/// 先剥离前导 system/developer 消息，取第一条 `role == "user"` 的消息。
+/// 若没有 user 消息（理论上不会），返回空串。
+pub fn session_id(messages: &[ChatMessage]) -> String {
+    let first_user = messages.iter().find(|m| m.role == "user");
+    match first_user {
+        Some(m) => sha16(m.content.extract_text().as_bytes()),
+        None => String::new(),
+    }
+}
+
+/// 计算单条消息的 message_id = SHA-256(feature_text + parent_id)。
+///
+/// `parent_id` 为 None 表示根消息（首条 user）。
+pub fn message_id(feature_text: &str, parent_id: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(feature_text.as_bytes());
+    // 用分隔符区分 "feature_text=A, parent=B" 与 "feature_text=A+B, parent=''"
+    hasher.update(b"\x00");
+    hasher.update(parent_id.unwrap_or("").as_bytes());
+    let result = hasher.finalize();
+    hex::encode(&result[..8])[..MESSAGE_ID_HEX].to_string()
+}
+
+/// 计算 feature_text（规范化文本，用于 message_id 哈希）。
+///
+/// 规则（对齐设计文档 §2.1）：
+/// - user：`"user:" + content`
+/// - assistant 无工具调用：`"assistant:" + content`
+/// - assistant 有工具调用：`"assistant:" + tool_calls[].name + arguments`（多个用 \x1f 分隔）
+/// - tool_result：`"tool_result:" + tool_call_id + ":" + content`
+pub fn feature_text(m: &ChatMessage) -> String {
+    match m.role.as_str() {
+        "user" => format!("user:{}", m.content.extract_text()),
+        "assistant" => {
+            if m.tool_calls.is_empty() {
+                format!("assistant:{}", m.content.extract_text())
+            } else {
+                let calls: Vec<String> = m.tool_calls.iter()
+                    .map(|tc| format!("{}|{}", tc.function.name, tc.function.arguments))
+                    .collect();
+                format!("assistant:{}", calls.join("\x1f"))
+            }
+        }
+        "tool" => {
+            // OpenAI 的 tool 角色（tool_result 的 wire 形式）
+            let call_id = m.tool_call_id.clone().unwrap_or_default();
+            format!("tool_result:{}:{}", call_id, m.content.extract_text())
+        }
+        "tool_result" => {
+            let call_id = m.tool_call_id.clone().unwrap_or_default();
+            format!("tool_result:{}:{}", call_id, m.content.extract_text())
+        }
+        _ => format!("{}:{}", m.role, m.content.extract_text()),
+    }
+}
+
+/// 从 MessageRecord 重建 feature_text（用于定位时匹配 JSONL 行）。
+///
+/// MessageRecord 是持久化形态，字段名与 ChatMessage 略不同（tool_calls 是 ToolCallRecord）。
+pub fn feature_text_of_record(r: &MessageRecord) -> String {
+    match r.role.as_str() {
+        "user" => format!("user:{}", r.content),
+        "assistant" => {
+            if r.tool_calls.is_empty() {
+                format!("assistant:{}", r.content)
+            } else {
+                let calls: Vec<String> = r.tool_calls.iter()
+                    .map(|tc| format!("{}|{}", tc.function.name, tc.function.arguments))
+                    .collect();
+                format!("assistant:{}", calls.join("\x1f"))
+            }
+        }
+        "tool" | "tool_result" => {
+            let call_id = r.tool_call_id.clone().unwrap_or_default();
+            format!("tool_result:{}:{}", call_id, r.content)
+        }
+        _ => format!("{}:{}", r.role, r.content),
+    }
+}
+
+/// 判断消息是否为"原生消息"（不是 EC 注入的投影消息）。
+///
+/// EC 注入的投影消息带 name 字段标记（ec_meta / ec_management / ec_recall_result）。
+pub fn is_projection_message(m: &ChatMessage) -> bool {
+    matches!(m.name.as_deref(), Some("ec_meta") | Some("ec_management") | Some("ec_recall_result"))
+}
+
+/// 判断消息是否为 recall 结果（增量估算与压缩时需跳过）。
+pub fn is_recall_result(m: &ChatMessage) -> bool {
+    m.name.as_deref() == Some("ec_recall_result")
+}
+
+/// 从 ChatMessage 构造 MessageRecord（用于 append 到 JSONL）。
+pub fn to_record(m: &ChatMessage, parent_id: Option<&str>) -> MessageRecord {
+    let ft = feature_text(m);
+    let id = message_id(&ft, parent_id);
+    let (tool_calls, tool_call_id, tool_name) = match m.role.as_str() {
+        "assistant" => (
+            m.tool_calls.iter().map(|tc| crate::ec::types::ToolCallRecord {
+                id: tc.id.clone(),
+                type_: tc.type_.clone(),
+                function: crate::ec::types::ToolCallFunction {
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                },
+            }).collect(),
+            None,
+            None,
+        ),
+        "tool" | "tool_result" => (
+            vec![],
+            m.tool_call_id.clone(),
+            // OpenAI tool 消息没有 name 字段承载工具名；tool_result wire 形式也一样。
+            // 工具名暂从调用方传入（见 to_record_with_tool_name）。
+            None,
+        ),
+        _ => (vec![], None, None),
+    };
+    MessageRecord {
+        id,
+        parent_id: parent_id.map(|s| s.to_string()),
+        role: m.role.clone(),
+        content: m.content.extract_text(),
+        tool_calls,
+        tool_call_id,
+        tool_name,
+        name: m.name.clone(),
+        ec: None,
+    }
+}
+
+/// 构造 tool_result 记录（带工具名）。
+pub fn tool_record(
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+    parent_id: Option<&str>,
+) -> MessageRecord {
+    let ft = format!("tool_result:{}:{}", tool_call_id, content);
+    let id = message_id(&ft, parent_id);
+    MessageRecord {
+        id,
+        parent_id: parent_id.map(|s| s.to_string()),
+        role: "tool_result".to_string(),
+        content: content.to_string(),
+        tool_calls: vec![],
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_name: Some(tool_name.to_string()),
+        name: None,
+        ec: None,
+    }
+}
+
+fn sha16(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    hex::encode(&result[..8])[..SESSION_ID_HEX].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::types::{MessageContent, ToolCall, ToolCallFunction};
+
+    fn user(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(content.to_string()),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn assistant(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(content.to_string()),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn session_id_is_first_user_sha() {
+        let msgs = vec![
+            ChatMessage { role: "system".to_string(), content: MessageContent::Text("sys".into()), tool_calls: vec![], tool_call_id: None, name: None },
+            user("帮我写个函数"),
+            assistant("好的"),
+        ];
+        // 首条 user = "帮我写个函数"
+        let sid = session_id(&msgs);
+        assert_eq!(sid, sha16("帮我写个函数".as_bytes()));
+        assert_eq!(sid.len(), 16);
+    }
+
+    #[test]
+    fn message_id_differs_for_duplicate_content() {
+        // 两个内容相同的 user，但 parent 不同 → id 不同
+        let a = message_id("user:继续", None);
+        let b = message_id("user:继续", Some("some-parent-id"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn message_id_stable_for_same_inputs() {
+        let a = message_id("user:继续", Some("p1"));
+        let b = message_id("user:继续", Some("p1"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn feature_text_distinguishes_roles() {
+        assert_eq!(feature_text(&user("hi")), "user:hi");
+        assert_eq!(feature_text(&assistant("hi")), "assistant:hi");
+    }
+
+    #[test]
+    fn feature_text_for_tool_calls() {
+        let m = ChatMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(String::new()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                type_: "function".to_string(),
+                function: ToolCallFunction { name: "bash".to_string(), arguments: "{\"cmd\":\"ls\"}".to_string() },
+            }],
+            tool_call_id: None,
+            name: None,
+        };
+        assert_eq!(feature_text(&m), "assistant:bash|{\"cmd\":\"ls\"}");
+    }
+
+    #[test]
+    fn is_projection_message_detects_ec_meta() {
+        let mut m = user("x");
+        assert!(!is_projection_message(&m));
+        m.name = Some("ec_meta".to_string());
+        assert!(is_projection_message(&m));
+    }
+}

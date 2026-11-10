@@ -1,0 +1,216 @@
+//! 预算检查与 token 估算（对齐 Pi 插件版 `ec-budget.ts` + 代理版增量规则）。
+//!
+//! ## 触发层次
+//!
+//! 1. **硬预算门**（请求前）：projected_tokens > hard_budget → 拒绝/降级。
+//! 2. **软阈值**（请求后）：projected_tokens > soft_threshold → 触发压缩。
+//! 3. **Growth Nudge**：自上次压缩以来累计增量 ≥ growth_nudge → 触发压缩。
+//!
+//! ## 关键规则：召回内容不计入增量
+//!
+//! recall 召回的内容（`name == "ec_recall_result"`）**必须跳过**，
+//! 否则全文召回一次 +10K token 会立刻触发又一次压缩（无新内容，浪费 + 死循环）。
+
+use crate::ec::identity::is_recall_result;
+use crate::ec::types::{ChatMessage, WindowConfig};
+
+/// 预算检查结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetCheck {
+    /// 预算充足，无需处理。
+    Ok,
+    /// 软阈值触发：建议在下次请求前执行压缩维护。
+    SoftTrigger { prompt_tokens: u32, threshold: u32 },
+    /// 硬预算超线：当前请求不可放行。
+    HardOverBudget { prompt_tokens: u32, hard_budget: u32 },
+}
+
+/// 执行预算检查。
+pub fn check(prompt_tokens: u32, window: &WindowConfig) -> BudgetCheck {
+    let effective_hard = window.hard_budget;
+
+    if prompt_tokens > effective_hard {
+        return BudgetCheck::HardOverBudget {
+            prompt_tokens,
+            hard_budget: effective_hard,
+        };
+    }
+
+    if prompt_tokens > window.budget.soft_threshold {
+        return BudgetCheck::SoftTrigger {
+            prompt_tokens,
+            threshold: window.budget.soft_threshold,
+        };
+    }
+
+    BudgetCheck::Ok
+}
+
+/// 估算 prompt 的 token 数（粗估：字符数 ÷ 3）。
+///
+/// **跳过 recall 结果消息**（`name == "ec_recall_result"`）——它们的 token 不计入增量。
+pub fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
+    let mut total = 0u32;
+    for m in messages {
+        // 跳过 recall 结果：不计入增量估算，避免召回内容触发压缩死循环
+        if is_recall_result(m) {
+            continue;
+        }
+        // 每条消息的基础开销（role + 格式）：约 4 token
+        total += 4;
+        total += m.content.estimated_tokens();
+        for tc in &m.tool_calls {
+            total += 10; // 工具调用的结构开销
+            total += (tc.function.arguments.len() as f64 / 3.0).ceil() as u32;
+        }
+    }
+    total
+}
+
+/// growth nudge 检查：自上次压缩以来累计增量是否 ≥ growth_nudge。
+pub fn should_growth_nudge(
+    current_tokens: u64,
+    last_compaction_tokens: u64,
+    growth_nudge: u32,
+) -> bool {
+    current_tokens.saturating_sub(last_compaction_tokens) >= growth_nudge as u64
+}
+
+/// 单条消息的 token 估算（含 4 token 固定开销）。
+/// 跳过 recall 结果（不计入预算，避免召回内容触发压缩）。
+pub fn estimate_message_tokens(m: &ChatMessage) -> u32 {
+    if is_recall_result(m) {
+        return 0;
+    }
+    let mut t = 4u32;
+    t += m.content.estimated_tokens();
+    for tc in &m.tool_calls {
+        t += 10;
+        t += (tc.function.arguments.len() as f64 / 3.0).ceil() as u32;
+    }
+    t
+}
+
+/// 估算单条 MessageRecord 的 token（正文 + 工具调用，粗估 utf8/3）。
+///
+/// 统一的持久化记录估算（index.rs / catchup.rs 共用，DRY）。
+/// 跳过 recall 结果（`name == "ec_recall_result"`）。
+pub fn estimate_record_tokens(r: &crate::ec::types::MessageRecord) -> u32 {
+    if r.name.as_deref() == Some("ec_recall_result") {
+        return 0;
+    }
+    let mut t = 4u32;
+    t += (r.content.len() as f64 / 3.0).ceil() as u32;
+    for tc in &r.tool_calls {
+        t += 10;
+        t += (tc.function.arguments.len() as f64 / 3.0).ceil() as u32;
+    }
+    t
+}
+
+/// 统一分段：把记录序列按 target_tokens 切成连续段（DRY，供 index_session / catchup 共用）。
+///
+/// 返回每段的 (start, end)（含）。规则：
+/// - 从 start 向后累计 token，超过 target_tokens 且段内至少一条时收口；
+/// - 段内至少一条（单条超预算也单独成段）；
+/// - recall 结果 token 计 0（不计入切分预算）。
+///
+/// `records` 可为 `&[MessageRecord]` 的任意切片（全链或游标之后）。
+/// 返回的下标相对于传入切片。空切片返回空。
+pub fn segment_records<D: std::borrow::Borrow<crate::ec::types::MessageRecord>>(
+    records: &[D],
+    target_tokens: u32,
+) -> Vec<(usize, usize)> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u32;
+    for i in 0..records.len() {
+        let cost = estimate_record_tokens(records[i].borrow());
+        if acc + cost > target_tokens && i > start {
+            segments.push((start, i - 1));
+            start = i;
+            acc = 0;
+        }
+        acc += cost;
+    }
+    segments.push((start, records.len() - 1));
+    segments
+}
+
+/// 尾部贴合：从消息数组尾部向前累积 token，直到预算用尽，返回窗口起点下标（含）。
+///
+/// 预算不足放任何一条时返回 len（空窗口，调用方只保留前置 system + 管理区 + 提示）。
+/// 对齐 Pi 版 `ec-blocks.ts` 的 `tailFitStartIndex`：
+/// - 从 to 向前累加，单条超预算就停（宁可空窗也不超线）
+/// - 工具链对齐（opener 与 closer 被窗口切开时继续丢最旧）由调用方负责，这里只做控量
+pub fn tail_fit_start(messages: &[ChatMessage], budget_tokens: u32) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let mut start = messages.len();
+    let mut acc = 0u32;
+    for i in (0..messages.len()).rev() {
+        let cost = estimate_message_tokens(&messages[i]);
+        if acc + cost > budget_tokens {
+            break;
+        }
+        acc += cost;
+        start = i;
+    }
+    start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::types::MessageContent;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: MessageContent::Text(content.to_string()),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn recall_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool_result".to_string(),
+            content: MessageContent::Text(content.to_string()),
+            tool_calls: vec![],
+            tool_call_id: Some("call_x".to_string()),
+            name: Some("ec_recall_result".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_budget_check() {
+        // 用 400K 窗口：soft = clamp(200K, 100K, 500K) = 200K，硬线 = 400K - 40K - 8K
+        let w = WindowConfig::for_window(400_000);
+        assert_eq!(check(50_000, &w), BudgetCheck::Ok);
+        assert!(matches!(check(210_000, &w), BudgetCheck::SoftTrigger { .. }));
+        assert!(matches!(check(400_000, &w), BudgetCheck::HardOverBudget { .. }));
+    }
+
+    #[test]
+    fn test_estimate_skips_recall() {
+        let msgs = vec![
+            msg("user", "帮我写函数"),
+            recall_msg("这是一大段召回的全文，占 10K token 的内容"),
+        ];
+        let tokens = estimate_prompt_tokens(&msgs);
+        // recall 消息被跳过，只剩 user 消息（4 + content/3）
+        assert_eq!(tokens, 4 + msg("user", "帮我写函数").content.estimated_tokens());
+    }
+
+    #[test]
+    fn test_growth_nudge() {
+        assert!(should_growth_nudge(100_000, 40_000, 50_000));
+        assert!(!should_growth_nudge(70_000, 40_000, 50_000));
+    }
+}

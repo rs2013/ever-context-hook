@@ -1,0 +1,20 @@
+# Rust 构建产物
+/target
+
+# 临时脚本输出、探针
+/temp/
+*.err
+
+# e2e 运行时数据（含 Tantivy 索引、会话 JSONL、统计）
+/e2e/data/
+
+# 参考二进制（ww3 core / wild-work3 / 插件 exe）与 e2e 插件安装目录
+*.exe
+/e2e/plugins/*/
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc

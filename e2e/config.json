@@ -1,0 +1,25 @@
+{
+  "core": {
+    "listen": "127.0.0.1:7864",
+    "api_key": "",
+    "admin_password": "",
+    "channels": null,
+    "accounts": null,
+    "cool_seconds_soft": 60,
+    "cool_seconds_hard": 43200,
+    "err_cooldown_seconds": 600,
+    "err_threshold": 3,
+    "daily_grant_buffer_sec": 1800,
+    "checkin_times": [
+      "09:00",
+      "21:00"
+    ],
+    "keepalive_hours": [
+      22
+    ],
+    "checkin_retry_until": 720,
+    "compat": {
+      "max_tokens_cap": 32000
+    }
+  }
+}
