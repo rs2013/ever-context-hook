@@ -44,7 +44,9 @@ pub fn leading_user_end(messages: &[ChatMessage]) -> usize {
 pub fn leading_user_anchor(messages: &[ChatMessage]) -> String {
     messages[..leading_user_end(messages)]
         .iter()
-        .filter(|m| m.role == "user")
+        // 排除 EC 注入的投影消息（ec_management/ec_meta/ec_recall_result），
+        // 否则下游把改写后的 request 回传时会污染锚定区、导致 session_id 漂移。
+        .filter(|m| m.role == "user" && !is_projection_message(m))
         .map(|m| m.content.extract_text())
         .collect::<Vec<_>>()
         .join("\n")
@@ -176,6 +178,15 @@ pub fn to_record(m: &ChatMessage, parent_id: Option<&str>) -> MessageRecord {
         id,
         parent_id: parent_id.map(|s| s.to_string()),
         role: m.role.clone(),
+        timestamp: None,
+        model: None,
+        channel: None,
+        thinking: None,
+        reasoning_effort: None,
+        usage: None,
+        stop_reason: None,
+        reasoning: None,
+        duration_ms: None,
         content: m.content.extract_text(),
         tool_calls,
         tool_call_id,
@@ -198,6 +209,15 @@ pub fn tool_record(
         id,
         parent_id: parent_id.map(|s| s.to_string()),
         role: "tool_result".to_string(),
+        timestamp: None,
+        model: None,
+        channel: None,
+        thinking: None,
+        reasoning_effort: None,
+        usage: None,
+        stop_reason: None,
+        reasoning: None,
+        duration_ms: None,
         content: content.to_string(),
         tool_calls: vec![],
         tool_call_id: Some(tool_call_id.to_string()),
@@ -280,6 +300,18 @@ mod tests {
         // 首个非 system/developer/user 是 tool_result，锚定区止于它之前
         assert_eq!(leading_user_end(&msgs), 2);
         assert_eq!(leading_user_anchor(&msgs), "hi");
+    }
+
+    #[test]
+    fn session_id_ignores_projection_messages() {
+        // ec_management 等投影 user 消息不得进入锚定区，否则下游回传改写请求时 session_id 漂移。
+        let plain = vec![user("hi"), user("second")];
+        let injected = vec![
+            ChatMessage { role: "user".to_string(), content: MessageContent::Text("[EC_CONTEXT ...]".into()), tool_calls: vec![], tool_call_id: None, name: Some("ec_management".into()) },
+            user("hi"),
+            user("second"),
+        ];
+        assert_eq!(session_id(&plain), session_id(&injected));
     }
 
     #[test]

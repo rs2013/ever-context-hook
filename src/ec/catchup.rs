@@ -38,6 +38,7 @@ pub struct CatchupConfig {
     pub core_data: String,
     pub plugins_dir: String,
     pub model: String,
+    pub thinking: bool,
     /// 单块目标 token（摘要一个片段的预算）。
     pub target_tokens: u32,
     /// 每块之间的间隔（让位主对话）。
@@ -59,6 +60,7 @@ impl Default for CatchupConfig {
             core_data: String::new(),
             plugins_dir: String::new(),
             model: String::new(),
+            thinking: false,
             target_tokens: 10_000,
             gap_ms: 200,
             summary_mode: SummaryMode::default(),
@@ -94,6 +96,9 @@ pub fn next_range(chain: &[MessageRecord], cursor: Option<usize>, target_tokens:
 ///
 /// 返回追赶的块数。
 pub fn run(config: &CatchupConfig) -> Result<u32, String> {
+    if config.model.trim().is_empty() || config.model == "unknown" {
+        return Err("缺少摘要模型：指定 --model 或在会话 assistant 记录中提供 model".to_string());
+    }
     // 锁
     let lock_path = lock::session_lock_path(&config.data_root, &config.session_id);
     let (_lock_guard, _, _) = lock::try_acquire(&lock_path)?;
@@ -132,8 +137,8 @@ pub fn run(config: &CatchupConfig) -> Result<u32, String> {
             &chain, start, end, config.summary_mode, config.full_context_max_tokens,
         );
         let t0 = std::time::Instant::now();
-        // 4. 调 core 摘要（显式关思考）+ 解析
-        let (res, parsed) = match compress::run_summary_call(&mut client, &config.model, &call) {
+        // 4. 按配置调用摘要模型并解析
+        let (res, parsed) = match compress::run_summary_call(&mut client, &config.model, config.thinking, &call) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("[ec-catchup] 摘要调用失败（跳过本段，下轮重试）: {e}");
@@ -357,6 +362,8 @@ mod tests {
             id: id.to_string(),
             parent_id: parent.map(|s| s.to_string()),
             role: "tool_result".to_string(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
             content: String::new(),
             tool_calls: vec![],
             tool_call_id: None,

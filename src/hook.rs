@@ -74,7 +74,13 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
 
     // ── 第 3 步：事件透传循环 ──
     // 收集响应中的 assistant 消息（用于 append 到 JSONL）
+    let started = std::time::Instant::now();
+    let response_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
     let mut response_text = String::new();
+    let mut response_reasoning = String::new();
+    let mut response_usage: Option<serde_json::Value> = None;
+    let mut stop_reason: Option<String> = None;
+    let mut upstream_ok = false;
     let mut response_tool_calls: Vec<crate::ec::types::ToolCall> = Vec::new();
     let mut last_prompt_tokens: u32 = 0;
     let mut last_completion_tokens: u32 = 0;
@@ -84,7 +90,8 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
             Ok(Some(ev)) => {
                 match ev.event.as_str() {
                     "upstream.end" | "upstream.done" => {
-                        log::info!("[ec-hook] upstream end");
+                        upstream_ok = ev.data.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        log::info!("[ec-hook] upstream end ok={upstream_ok}");
                         break 0;
                     }
                     "text.delta" => {
@@ -122,11 +129,23 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
                         }
                     }
                     "usage" => {
+                        response_usage = Some(ev.data.clone());
                         if let Some(pt) = ev.data.get("prompt_tokens").and_then(|v| v.as_u64()) {
                             last_prompt_tokens = pt as u32;
                         }
                         if let Some(ct) = ev.data.get("completion_tokens").and_then(|v| v.as_u64()) {
                             last_completion_tokens = ct as u32;
+                        }
+                        if let Err(e) = s.event(&ev.event, ev.data) {
+                            log::error!("[ec-hook] 写下游事件失败: {e}");
+                            break 1;
+                        }
+                    }
+                    "reasoning.delta" | "finish_reason" => {
+                        if ev.event == "reasoning.delta" {
+                            if let Some(c) = ev.data.get("content").and_then(|v| v.as_str()) { response_reasoning.push_str(c); }
+                        } else {
+                            stop_reason = ev.data.get("reason").and_then(|v| v.as_str()).map(str::to_owned);
                         }
                         if let Err(e) = s.event(&ev.event, ev.data) {
                             log::error!("[ec-hook] 写下游事件失败: {e}");
@@ -156,7 +175,7 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
 
     // ── 第 4 步：append 新消息 + 更新叶子 + 压缩判断 ──
     // 有正文或有工具调用都落盘（bug ④ 修复：纯工具调用的 assistant 回复也要落盘）
-    if exit_code == 0 && (!response_text.is_empty() || !response_tool_calls.is_empty()) {
+    if exit_code == 0 && upstream_ok && (!response_text.is_empty() || !response_tool_calls.is_empty() || !response_reasoning.is_empty()) {
         // 计算新消息的 parent_id：当前 leaf（定位文件里的），或请求最后一条原生消息
         let parent = leaf.clone().or_else(|| {
             // 无 leaf（新会话）：从请求最后一条原生消息算
@@ -181,6 +200,16 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
             id: ec::identity::message_id(&feature, parent.as_deref()),
             parent_id: parent.clone(),
             role: "assistant".to_string(),
+            timestamp: response_started,
+            model: (cfg.model != "unknown").then(|| cfg.model.clone()),
+            channel: s.params.get("upstream").and_then(|r| r.get("channel_id")).and_then(|v| v.as_str())
+                .map(str::to_owned),
+            thinking: s.params.get("request").and_then(|r| r.get("thinking")).and_then(|v| v.as_bool()),
+            reasoning_effort: s.params.get("request").and_then(|r| r.get("reasoning_effort")).and_then(|v| v.as_str()).map(str::to_owned),
+            usage: response_usage,
+            stop_reason,
+            reasoning: (!response_reasoning.is_empty()).then_some(response_reasoning),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
             content: response_text.clone(),
             tool_calls: response_tool_calls.iter().map(|tc| crate::ec::types::ToolCallRecord {
                 id: tc.id.clone(),
@@ -196,9 +225,13 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
             ec: None,
         };
 
-        let _ = store.append(session_id, &[response_rec.clone()]);
-        let _ = store.update_leaf(session_id, &response_rec.id);
-        log::info!("[ec-hook] appended assistant response, leaf={}", response_rec.id);
+        match store.append(session_id, &[response_rec.clone()]) {
+            Ok(_) => {
+                if let Err(e) = store.update_leaf(session_id, &response_rec.id) { log::warn!("[ec-hook] 更新 leaf 失败: {e}"); }
+                log::info!("[ec-hook] appended assistant response, leaf={}", response_rec.id);
+            }
+            Err(e) => log::warn!("[ec-hook] assistant 落盘失败: {e}"),
+        }
 
         // 压缩触发已移到 prepare 阶段（那里有完整 messages 且可 spawn catchup）。
         // 这里只记录 usage，供后续估算校准用。
@@ -282,8 +315,11 @@ pub fn handle_prepare(req_id: &str, params: &serde_json::Value) -> Result<serde_
     // 日常增量压缩触发：未摘要 token 攒够一块（≥ target_tokens）且投影超软阈值
     // → 后台追赶子进程补摘要（detach）。不只在 is_new：长会话每轮新增内容也会攒段。
     // 增量值 = target_tokens（对齐需求 ②：增量计算用 target 且统一算法）。
-    let unsummarized_tokens: u32 = chain.iter()
-        .filter(|r| r.ec.is_none())
+    // 未摘要 token = 游标之后（尚未折叠）的记录；不能按「记录是否有 ec 字段」统计，
+    // 因为 catchup 只在每块末条盖 ec，块内前 N-1 条永远 ec.is_none()，会被重复计入，
+    // 导致每轮 prepare 空跑 spawn_catchup（见 docs/EC-旧对话实测记录.md 的 20,991）。
+    let cursor = ec::catchup::cursor_index(&chain);
+    let unsummarized_tokens: u32 = chain[cursor.map(|c| c + 1).unwrap_or(0)..].iter()
         .map(ec::budget::estimate_record_tokens)
         .sum();
     if unsummarized_tokens >= cfg.window.budget.target_tokens {
@@ -298,9 +334,14 @@ pub fn handle_prepare(req_id: &str, params: &serde_json::Value) -> Result<serde_
     // 2. 构建管理区
     let management = ec::projection::build_management_area(&chain, &cfg.window, &cfg.session_id);
     let mgmt_chars = management.len(); // 先取长度：下面 json! 会移动 management
+    // 管理区与注入工具同样占用 prompt 预算；估算必须计入，否则实际 prompt 可能超硬线。
+    let management_tokens = ec::projection::estimate_management_tokens(&chain, &cfg.window, &cfg.session_id);
+    let tools_tokens = ec::budget::estimate_json_tokens(&ec_recall_tool_def());
 
-    // 3. 预算检查：估算全量 prompt token
-    let projected = ec::budget::estimate_prompt_tokens(&cfg.messages);
+    // 3. 预算检查：估算全量 prompt token（原生 messages + 管理区 + 注入工具）
+    let projected = ec::budget::estimate_prompt_tokens(&cfg.messages)
+        .saturating_add(management_tokens)
+        .saturating_add(tools_tokens);
     let hard_budget = cfg.window.hard_budget;
     let degrade_target = cfg.window.budget.degrade_target;
     let over_hard = projected > hard_budget;
@@ -341,7 +382,6 @@ pub fn handle_prepare(req_id: &str, params: &serde_json::Value) -> Result<serde_
         // 超硬线：尾部贴合——只保留能塞进降级目标的最近消息。
         // degrade_target = soft_threshold × degrade_target_ratio（默认 0.6），比硬预算更激进，
         // 避免每轮新内容都重新触发降级（留出余量让日常增长交回压缩维护）。
-        let management_tokens = ec::projection::estimate_management_tokens(&chain, &cfg.window, &cfg.session_id);
         // 无摘要块时用降级提示词（带 few-shot），有摘要块时用硬线提示词
         let notice = if management.is_empty() { DEGRADED_NOTICE } else { HARD_LINE_NOTICE };
         let notice_tokens = (notice.len() as f64 / 3.0).ceil() as u32 + 4;
@@ -350,15 +390,19 @@ pub fn handle_prepare(req_id: &str, params: &serde_json::Value) -> Result<serde_
             .saturating_sub(sys_tokens)
             .saturating_sub(management_tokens)
             .saturating_sub(notice_tokens);
-        // 尾部贴合 + 首条 user 锚定区保护：tail_start 不得越过首个 assistant 之前的 user 区，
-        // 否则下次请求 session_id 会变、无法定位 JSONL。
-        let leading_user_end = ec::identity::leading_user_end(msgs);
-        let tail_start = (ec::budget::tail_fit_start(&msgs[sys_end..], room) + sys_end)
-            .min(leading_user_end);
+        // 首条 user 锚定区是会话身份（session_id）的基石，必须整段保留；
+        // 它不是「可裁剪的旧历史」，不能与尾部窗口用 min/max 混在一个窗口里算。
+        // 正确做法：锚定区独立保留并先扣其成本，再对锚定区之后的消息做尾部贴合，两段拼接。
+        let (anchor_end, tail_start) = ec::budget::anchor_and_tail_start(msgs, sys_end, room);
+        let anchor = &msgs[sys_end..anchor_end];
         dbg_tail_start = Some(tail_start);
+        log::info!("[ec-prepare] 硬线降级 room={} anchor={}条 tail_start={} anchor_end={} kept={}条",
+            room, anchor.len(), tail_start, anchor_end, msgs.len() - tail_start);
+        for m in anchor {
+            new_msgs.push(serde_json::to_value(m).unwrap_or(serde_json::Value::Null));
+        }
         let kept_tokens: u32 = msgs[tail_start..].iter().map(ec::budget::estimate_message_tokens).sum();
-        log::info!("[ec-prepare] 硬线降级 room={} tail_start={} leading_user_end={} kept={}条 kept_tokens={}",
-            room, tail_start, leading_user_end, msgs.len() - tail_start, kept_tokens);
+        log::info!("[ec-prepare] 硬线降级 kept_tokens={}", kept_tokens);
         for m in &msgs[tail_start..] {
             new_msgs.push(serde_json::to_value(m).unwrap_or(serde_json::Value::Null));
         }
@@ -468,6 +512,11 @@ fn spawn_catchup(cfg: &HookConfig) {
         std::path::Path::new(&cfg.data_root).parent().map(|p| p.display().to_string()).unwrap_or_default()
     });
 
+    // 此处是正常对话触发的增量压缩；手工旧会话追赶走 catchup CLI。
+    let compact = &cfg.ec.compact;
+    let model = compact.model.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or(&cfg.model);
+    let thinking = compact.thinking.unwrap_or_else(|| cfg.request_thinking.unwrap_or(false));
+    if model == "unknown" { log::warn!("[ec-hook] 会话缺少模型，跳过后台压缩"); return; }
     let child = std::process::Command::new(&exe)
         .args([
             "catchup",
@@ -476,7 +525,9 @@ fn spawn_catchup(cfg: &HookConfig) {
             "--core", &core_exe,
             "--core-data", &core_data,
             "--plugins", &plugins_dir,
-            "--model", &cfg.model,
+            "--model", model,
+            "--thinking", if thinking { "true" } else { "false" },
+            "--target-tokens", &cfg.window.budget.target_tokens.to_string(),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

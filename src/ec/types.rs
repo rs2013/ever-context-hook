@@ -18,6 +18,29 @@ pub struct MessageRecord {
     pub parent_id: Option<String>,
     /// user | assistant | tool_result
     pub role: String,
+    /// EC 观察到响应开始的时间（Unix 毫秒）；导入历史时不冒充原始创建时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+    /// 对话模型；历史请求未携带模型时保持空值，不推测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 本轮上游响应的渠道标识（若 ww3 显式提供）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// 请求中的 thinking / reasoning_effort；不是实际推理发生与否的证明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// ww3 的 usage 事件原样保存（非 Pi usage，字段及计费口径不同）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// 文本正文（user/assistant 有正文；tool_result 的正文是工具输出）。
     #[serde(default)]
     pub content: String,
@@ -117,6 +140,9 @@ pub struct ChatMessage {
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    /// 显式 JSON null（OpenAI 工具调用 assistant 消息的常见形态）：
+    /// 用 unit 变体承接，避免整条消息反序列化失败被静默丢弃。
+    Null,
 }
 
 impl Default for MessageContent {
@@ -136,6 +162,7 @@ impl MessageContent {
                     .collect::<Vec<_>>()
                     .join(" ")
             }
+            MessageContent::Null => String::new(),
         }
     }
 
@@ -253,5 +280,24 @@ impl WindowConfig {
             .saturating_sub(budget.reserve_tokens)
             .saturating_sub(max_output_tokens);
         Self { context_window, max_output_tokens, hard_budget, budget }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_null_parses_with_tool_calls() {
+        // OpenAI 工具调用 assistant 消息常见 content:null，修复前会整条解析失败被丢弃。
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]
+        });
+        let m: ChatMessage = serde_json::from_value(raw).expect("content:null 应能解析");
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.content.extract_text(), "");
     }
 }

@@ -89,7 +89,7 @@ impl CoreClient {
     /// 发一次 chat.generate，阻塞到 result，返回拼接正文 + finish_reason。
     ///
     /// `messages`：OpenAI Chat 消息数组（serde_json::Value）。
-    /// `thinking`：是否开启思考（压缩用 false，提升效率）。
+    /// `thinking`：摘要请求的思考开关，由 compact/catchup 配置决定。
     pub fn chat(&mut self, model: &str, messages: &[serde_json::Value], thinking: bool) -> Result<ChatResult, String> {
         self.req_seq += 1;
         let id = format!("ec-compress-{}", self.req_seq);

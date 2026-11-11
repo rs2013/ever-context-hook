@@ -20,6 +20,8 @@ pub struct HookConfig {
     pub chain_index: usize,
     pub chain_total: usize,
     pub model: String,
+    /// 当前对话请求的思考开关（只有明确传入时才存在）。
+    pub request_thinking: Option<bool>,
     /// 请求声明的 max_tokens（用于计算可用预算）。
     pub max_tokens: Option<u32>,
     /// 会话 ID（首条 user 锚定区 SHA）。
@@ -63,6 +65,57 @@ pub struct EcConfig {
     /// 单块目标 token（增量压缩/索引分段的块大小，默认 10_000）。
     #[serde(default = "default_target_tokens")]
     pub target_tokens: u32,
+    /// 正常对话增量压缩；未指定模型时使用本轮对话模型。
+    #[serde(default)]
+    pub compact: SummaryLlmConfig,
+    /// 旧对话追赶；未指定模型时使用会话最后一条 assistant 的模型。
+    #[serde(default)]
+    pub catchup: SummaryLlmConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_models_are_independently_configurable() {
+        let params = serde_json::json!({
+            "request": {"model": "dialog-model", "thinking": true, "messages": [{"role": "user", "content": "hi"}]},
+            "config": {"compact": {"model": "small-model", "thinking": false},
+                       "catchup": {"model": "archive-model", "thinking": true}}
+        });
+        let cfg = HookConfig::from_params(&params);
+        assert_eq!(cfg.model, "dialog-model");
+        assert_eq!(cfg.request_thinking, Some(true));
+        assert_eq!(cfg.ec.compact.model.as_deref(), Some("small-model"));
+        assert_eq!(cfg.ec.compact.thinking, Some(false));
+        assert_eq!(cfg.ec.catchup.model.as_deref(), Some("archive-model"));
+        assert_eq!(cfg.ec.catchup.thinking, Some(true));
+        let default = HookConfig::from_params(&serde_json::json!({"request":{"model":"dialog-model"}}));
+        assert!(default.ec.compact.model.is_none() && default.ec.catchup.model.is_none());
+    }
+
+    #[test]
+    fn max_tokens_overrides_output_reserve() {
+        let params = serde_json::json!({
+            "request": {"model": "gpt-4", "max_tokens": 2048, "messages": [{"role":"user","content":"hi"}]}
+        });
+        let cfg = HookConfig::from_params(&params);
+        assert_eq!(cfg.max_tokens, Some(2048));
+        assert_eq!(cfg.window.max_output_tokens, 2048);
+        assert_eq!(
+            cfg.window.hard_budget,
+            cfg.window.context_window - cfg.window.budget.reserve_tokens - 2048
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SummaryLlmConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 fn default_true() -> bool { true }
@@ -82,6 +135,8 @@ impl Default for EcConfig {
             degrade_target_ratio: 0.6,
             fail_open: false,
             target_tokens: 10_000,
+            compact: SummaryLlmConfig::default(),
+            catchup: SummaryLlmConfig::default(),
         }
     }
 }
@@ -97,6 +152,7 @@ impl HookConfig {
         let request = params.get("request");
         let model = request.and_then(|r| r.get("model"))
             .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let request_thinking = request.and_then(|r| r.get("thinking")).and_then(|v| v.as_bool());
         let max_tokens = request.and_then(|r| r.get("max_tokens"))
             .and_then(|v| v.as_u64()).map(|v| v as u32);
 
@@ -106,7 +162,14 @@ impl HookConfig {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| serde_json::from_value(m.clone()).ok())
+                    .filter_map(|m| match serde_json::from_value(m.clone()) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            // 不再静默丢弃：把失败原文记入日志，便于发现 content:null/多模态等解析缺口。
+                            log::warn!("[ec-config] 消息解析失败已跳过: {e}; raw={}", m);
+                            None
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -122,6 +185,14 @@ impl HookConfig {
         // 上下文窗口：从模型名推断，硬预算/软阈值可用配置覆盖
         let context_window = infer_context_window(&model);
         let mut window = WindowConfig::for_window(context_window);
+        // 请求声明的 max_tokens 优先作为输出预留，替换 for_window 的固定 8192。
+        if let Some(mt) = max_tokens {
+            window.max_output_tokens = mt;
+            window.hard_budget = window
+                .context_window
+                .saturating_sub(window.budget.reserve_tokens)
+                .saturating_sub(mt);
+        }
         if ec.hard_budget > 0 {
             window.hard_budget = ec.hard_budget;
         }
@@ -147,6 +218,7 @@ impl HookConfig {
             chain_index,
             chain_total,
             model,
+            request_thinking,
             max_tokens,
             session_id,
             messages,

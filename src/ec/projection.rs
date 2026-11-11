@@ -45,7 +45,7 @@ pub fn build_management_area(chain: &[MessageRecord], budget: &WindowConfig, ses
     }
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("[EC_CONTEXT rev={}]", blocks.len())); // rev 简化：用块数表示
+    lines.push(format!("[EC_CONTEXT session={session_id} rev={}]", blocks.len())); // session 稳定，可安全进头部
 
     // 目录区：index_only 块，按目录预算裁剪（汰出最旧，保留最新）
     let directory: Vec<(&str, &EcProjection)> = blocks.iter()
@@ -73,7 +73,7 @@ pub fn build_management_area(chain: &[MessageRecord], budget: &WindowConfig, ses
             lines.push(format!("{id} {title}"));
         }
         if dir_omitted > 0 {
-            lines.push(format!("(部分标题已汰出，可调用 ec_recall directory --session_id {session_id} 获取完整目录)"));
+            lines.push(format!("(部分标题已汰出，可调用 ec_recall directory --session {session_id} 获取完整目录)"));
         }
         if omitted_count > 0 {
             lines.push(format!("({omitted_count} 个块已滚出，可用 ec-recall 召回)"));
@@ -112,7 +112,7 @@ pub fn build_management_area(chain: &[MessageRecord], budget: &WindowConfig, ses
             lines.push(format!("- {h}"));
         }
         if highlights_omitted > 0 {
-            lines.push(format!("(部分精华已汰出，可调用 ec_recall highlights --session_id {session_id} 获取完整精华区)"));
+            lines.push(format!("(部分精华已汰出，可调用 ec_recall highlights --session {session_id} 获取完整精华区)"));
         }
         lines.push("[/HIGHLIGHTS]".to_string());
     }
@@ -165,6 +165,8 @@ mod tests {
             id: id.to_string(),
             parent_id: None,
             role: "tool_result".to_string(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
             content: String::new(),
             tool_calls: vec![],
             tool_call_id: None,

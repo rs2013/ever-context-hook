@@ -231,13 +231,14 @@ pub fn build_summary_call(
     SummaryCall { effective_mode: SummaryMode::Fragment, messages, user_content: content }
 }
 
-/// 执行一次摘要请求：显式关思考（压缩不需要推理），返回上游结果与解析产物。
+/// 执行一次摘要请求：思考开关由调用方按 compact/catchup 策略决定。
 pub fn run_summary_call(
     client: &mut CoreClient,
     model: &str,
+    thinking: bool,
     call: &SummaryCall,
 ) -> Result<(ChatResult, Option<Summary>), String> {
-    let res = client.chat(model, &call.messages, false)?; // thinking=false：显式关思考
+    let res = client.chat(model, &call.messages, thinking)?;
     let parsed = parse_summary(&res.text);
     Ok((res, parsed))
 }

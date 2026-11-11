@@ -123,15 +123,40 @@ fn main() {
             }
         }
         "catchup" => {
+            // 手工旧对话追赶读取最近一轮 assistant 模型；--model/--thinking 可显式覆盖。
             // 索引追赶：后台逐段调 LLM 补摘要，直到追平
             // 用法: ever-context-hook catchup --session <id> --data <dir> --core <core路径> --core-data <core数据目录> --plugins <插件目录> --model <摘要模型>
+            let llm_config = env::var("EC_CATCHUP_CONFIG").ok()
+                .and_then(|v| serde_json::from_str::<ec::config::SummaryLlmConfig>(&v).ok()).unwrap_or_default();
             let cfg = ec::catchup::CatchupConfig {
                 session_id: arg_value(&args, "--session").unwrap_or_default(),
                 data_root: arg_value(&args, "--data").unwrap_or_else(|| env::var("EC_DATA_ROOT").unwrap_or_default()),
                 core_exe: arg_value(&args, "--core").unwrap_or_else(|| "ww3-core".to_string()),
                 core_data: arg_value(&args, "--core-data").unwrap_or_default(),
                 plugins_dir: arg_value(&args, "--plugins").unwrap_or_default(),
-                model: arg_value(&args, "--model").unwrap_or_default(),
+                model: arg_value(&args, "--model").or_else(|| llm_config.model.clone()).unwrap_or_else(|| {
+                    let root = arg_value(&args, "--data").unwrap_or_else(|| env::var("EC_DATA_ROOT").unwrap_or_default());
+                    let session = arg_value(&args, "--session").unwrap_or_default();
+                    let store = ec::store::Store::new(&root);
+                    store.read_leaf(&session).and_then(|leaf| store.load_chain(&session, &leaf).ok())
+                        .and_then(|chain| chain.into_iter().rev().find_map(|r| (r.role == "assistant").then_some(r.model).flatten()))
+                        .unwrap_or_default()
+                }),
+                thinking: match arg_value(&args, "--thinking").as_deref() {
+                    Some("true") => true,
+                    Some("false") => false,
+                    None => {
+                        llm_config.thinking.unwrap_or_else(|| {
+                            let root = arg_value(&args, "--data").unwrap_or_else(|| env::var("EC_DATA_ROOT").unwrap_or_default());
+                            let session = arg_value(&args, "--session").unwrap_or_default();
+                            let store = ec::store::Store::new(&root);
+                            store.read_leaf(&session).and_then(|leaf| store.load_chain(&session, &leaf).ok())
+                                .and_then(|chain| chain.into_iter().rev().find_map(|r| (r.role == "assistant").then_some(r.thinking).flatten()))
+                                .unwrap_or(false)
+                        })
+                    },
+                    Some(other) => { eprintln!("未知 --thinking: {other}（可选 true|false）"); process::exit(2); }
+                },
                 target_tokens: arg_value(&args, "--target-tokens").and_then(|v| v.parse().ok()).unwrap_or(10_000),
                 gap_ms: arg_value(&args, "--gap-ms").and_then(|v| v.parse().ok()).unwrap_or(200),
                 summary_mode: match arg_value(&args, "--summary-mode").as_deref() {
@@ -143,7 +168,7 @@ fn main() {
                 trace_path: arg_value(&args, "--trace"),
             };
             if cfg.session_id.is_empty() || cfg.core_data.is_empty() {
-                eprintln!("用法: ever-context-hook catchup --session <id> --core-data <core数据目录> [--core <路径>] [--plugins <目录>] [--model <模型>] [--target-tokens <n>] [--gap-ms <n>] [--summary-mode fragment|full_context] [--full-context-max-tokens <n>] [--trace <trace.jsonl>]");
+                eprintln!("用法: ever-context-hook catchup --session <id> --core-data <core数据目录> [--core <路径>] [--plugins <目录>] [--model <模型>] [--thinking true|false] [--target-tokens <n>] [--gap-ms <n>] [--summary-mode fragment|full_context] [--full-context-max-tokens <n>] [--trace <trace.jsonl>]");
                 process::exit(2);
             }
             match ec::catchup::run(&cfg) {

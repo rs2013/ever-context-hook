@@ -42,33 +42,44 @@ pub fn search(session_id: &str, query: &str, limit: usize, data_root: &str) -> V
     // 祖先链 message_id 集合（分支过滤白名单）
     let chain_ids: std::collections::HashSet<String> = chain.iter().map(|r| r.id.clone()).collect();
 
-    // Tantivy 粗筛
+    // Tantivy 粗筛：候选量迭代放大。兄弟分支的命中会被白名单过滤，
+    // 固定 limit*3 可能在多分支场景下把当前分支结果挤掉，故按需倍增。
     let index_dir = std::path::Path::new(data_root).join("index");
-    let index = match index::open_index(&index_dir) {
-        Ok(i) => i,
-        Err(_) => return Vec::new(), // 索引不可用：无结果（fail-open，不阻断）
-    };
-    let hits = match index::search(&index, session_id, "ec_block", query, limit * 3) {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
-    };
-
-    // 内存过滤：只保留当前分支上的段；命中后回读 JSONL 祖先链取权威 title/summary
-    // （索引侧 title/summary 只索引不 STORED，原文唯一权威在 JSONL，需求 ⑦）。
-    hits.into_iter()
-        .filter(|h| chain_ids.contains(&h.message_id))
-        .take(limit)
-        .filter_map(|h| {
-            let rec = chain.iter().find(|r| r.id == h.message_id)?;
-            let ec = rec.ec.as_ref()?;
-            Some(RecallHit {
-                block_id: h.message_id,
-                title: if ec.title.is_empty() { "(无标题)".to_string() } else { ec.title.clone() },
-                summary: ec.summary.clone(),
-                score: h.score,
-            })
-        })
-        .collect()
+    let mut hits: Vec<RecallHit> = Vec::new();
+    if let Ok(index) = index::open_index(&index_dir) {
+        let mut fetch = limit.max(1).saturating_mul(3);
+        loop {
+            let fetched = match index::search(&index, session_id, "ec_block", query, fetch) {
+                Ok(h) => h,
+                Err(_) => break, // 索引查询失败：退回内存降级路径
+            };
+            let got = fetched.len();
+            // 命中后回读 JSONL 祖先链取权威 title/summary（索引侧只索引不 STORED）
+            hits = fetched.into_iter()
+                .filter(|h| chain_ids.contains(&h.message_id))
+                .filter_map(|h| {
+                    let rec = chain.iter().find(|r| r.id == h.message_id)?;
+                    let ec = rec.ec.as_ref()?;
+                    Some(RecallHit {
+                        block_id: h.message_id,
+                        title: if ec.title.is_empty() { "(无标题)".to_string() } else { ec.title.clone() },
+                        summary: ec.summary.clone(),
+                        score: h.score,
+                    })
+                })
+                .take(limit)
+                .collect();
+            if hits.len() >= limit || got < fetch || fetch >= 100_000 {
+                break;
+            }
+            fetch = fetch.saturating_mul(2);
+        }
+    }
+    // 索引不可用或无命中：走纯内存降级（search_chain 已实现，接入主流程）。
+    if hits.is_empty() {
+        return search_chain(&chain, query, limit);
+    }
+    hits
 }
 
 /// 召回完整标题目录（祖先链上所有压缩块的 block_id + title，不限状态）。
@@ -263,6 +274,8 @@ mod tests {
             id: id.to_string(),
             parent_id: None,
             role: "user".to_string(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
             content: content.to_string(),
             tool_calls: vec![],
             tool_call_id: None,
@@ -277,6 +290,8 @@ mod tests {
             id: id.to_string(),
             parent_id: None,
             role: "tool_result".to_string(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
             content: String::new(),
             tool_calls: vec![],
             tool_call_id: None,

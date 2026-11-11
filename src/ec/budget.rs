@@ -67,6 +67,25 @@ pub fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
     total
 }
 
+/// 估算任意 JSON 值（如工具定义）的 token：序列化长度 ÷ 3 + 结构开销。
+pub fn estimate_json_tokens(v: &serde_json::Value) -> u32 {
+    let len = serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
+    if len == 0 { 0 } else { ((len as f64) / 3.0).ceil() as u32 + 8 }
+}
+
+/// 锚定区 + 尾部贴合：返回 (锚定区结束下标, 尾部窗口起点)。
+///
+/// 首条 user 锚定区 [sys_end, anchor_end) 是 session_id 的基石，整段保留；
+/// 锚定区成本先从预算中扣除，再对锚定区之后的消息做尾部贴合。
+/// 两段拼接后即为降级后的消息序列（中间可能不连续）。
+pub fn anchor_and_tail_start(messages: &[ChatMessage], sys_end: usize, budget_tokens: u32) -> (usize, usize) {
+    let anchor_end = crate::ec::identity::leading_user_end(messages).max(sys_end);
+    let anchor_tokens: u32 = messages[sys_end..anchor_end].iter().map(estimate_message_tokens).sum();
+    let tail_room = budget_tokens.saturating_sub(anchor_tokens);
+    let tail_start = tail_fit_start(&messages[anchor_end..], tail_room) + anchor_end;
+    (anchor_end, tail_start)
+}
+
 /// growth nudge 检查：自上次压缩以来累计增量是否 ≥ growth_nudge。
 pub fn should_growth_nudge(
     current_tokens: u64,
@@ -212,5 +231,27 @@ mod tests {
     fn test_growth_nudge() {
         assert!(should_growth_nudge(100_000, 40_000, 50_000));
         assert!(!should_growth_nudge(70_000, 40_000, 50_000));
+    }
+
+    #[test]
+    fn test_anchor_and_tail_start_keeps_anchor() {
+        let msgs = vec![
+            msg("system", "sys"),
+            msg("user", "首条用户问题，作为 session 锚定区"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ];
+        // sys_end=1；预算 8 连锚定区都放不下，但锚定区必须整段保留。
+        let (anchor_end, tail_start) = anchor_and_tail_start(&msgs, 1, 8);
+        assert_eq!(anchor_end, 2, "锚定区应结束于首条 user 之后");
+        assert_eq!(msgs[1].role, "user");
+        assert!(tail_start >= anchor_end, "尾部窗口不得回退进锚定区");
+    }
+
+    #[test]
+    fn test_estimate_json_tokens_positive() {
+        assert!(estimate_json_tokens(&serde_json::json!({"name":"ec_recall"})) > 0);
     }
 }

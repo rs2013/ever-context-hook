@@ -368,6 +368,8 @@ mod tests {
             id: id.to_string(),
             parent_id: parent.map(|s| s.to_string()),
             role: role.to_string(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
             content: content.to_string(),
             tool_calls: vec![],
             tool_call_id: None,
