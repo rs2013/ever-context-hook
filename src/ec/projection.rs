@@ -73,10 +73,10 @@ pub fn build_management_area(chain: &[MessageRecord], budget: &WindowConfig, ses
             lines.push(format!("{id} {title}"));
         }
         if dir_omitted > 0 {
-            lines.push(format!("(部分标题已汰出，可调用 ec_recall directory --session {session_id} 获取完整目录)"));
+            lines.push(format!("(部分标题已汰出，可执行 {bin} recall --directory --session {session_id} 获取完整目录)", bin = crate::ec::bin_hint()));
         }
         if omitted_count > 0 {
-            lines.push(format!("({omitted_count} 个块已滚出，可用 ec-recall 召回)"));
+            lines.push(format!("({omitted_count} 个块已滚出，可用 {bin} recall 召回)", bin = crate::ec::bin_hint()));
         }
         lines.push("[/DIRECTORY]".to_string());
     }
@@ -112,7 +112,7 @@ pub fn build_management_area(chain: &[MessageRecord], budget: &WindowConfig, ses
             lines.push(format!("- {h}"));
         }
         if highlights_omitted > 0 {
-            lines.push(format!("(部分精华已汰出，可调用 ec_recall highlights --session {session_id} 获取完整精华区)"));
+            lines.push(format!("(部分精华已汰出，可执行 {bin} recall --highlights --session {session_id} 获取完整精华区)", bin = crate::ec::bin_hint()));
         }
         lines.push("[/HIGHLIGHTS]".to_string());
     }

@@ -29,6 +29,7 @@ stdin JSONL ──▶ [RPC layer] ──▶ [hook::handle_stream]
 | `call`（默认） | ww3 hook 契约入口：`call --data <插件数据目录>`，core 每请求 spawn 一次，走 stdin JSONL RPC |
 | `manifest` | 输出 `manifest.json`（`--out <path>` 可写文件） |
 | `recall` | 检索 CLI，供人或 LLM 通过 bash 调用以搜索会话历史（不调用 LLM） |
+| `rag` | 检索 + LLM 生成：只把相关度最高的 top-k 条片段交给模型，产出带 `[1][2]` 引用的回答 |
 | `catchup` | 旧会话离线追赶压缩；可传 `--model`、`--thinking true|false` |
 | `ping` | 自检 |
 | `--help` / `-h` / `help` | 打印完整命令行手册 |
@@ -53,7 +54,7 @@ e2e/            ww3 沙箱配置与手动验证日志
 {"compact":{"model":"可选模型 ID","thinking":true},"catchup":{"model":"可选模型 ID","thinking":false}}
 ```
 
-`compact.model` 留空时取当前 `request.model`；`compact.thinking` 留空时跟随请求中的 `thinking`（请求未明确传入时为 `false`）。当前请求触发的后台增量压缩虽然调用同一 `catchup` 子命令，仍按 **compact** 配置执行；`catchup` 配置用于独立旧会话追赶。运行旧会话 CLI 时可用 `--model`、`--thinking` 显式指定，或者通过环境变量 `EC_CATCHUP_CONFIG='{"model":"...","thinking":false}'` 指定；未设置时从最后一条已落盘 assistant 的 `model` / `thinking` 读取，缺少模型则报错（历史记录没有模型时请手动指定）。未提供思考记录时按 `false` 执行。`rag` 模型和检索增强回答暂不实现。
+`compact.model` 留空时取当前 `request.model`；`compact.thinking` 留空时跟随请求中的 `thinking`（请求未明确传入时为 `false`）。当前请求触发的后台增量压缩虽然调用同一 `catchup` 子命令，仍按 **compact** 配置执行；`catchup` 配置用于独立旧会话追赶。运行旧会话 CLI 时可用 `--model`、`--thinking` 显式指定，或者通过环境变量 `EC_CATCHUP_CONFIG='{"model":"...","thinking":false}'` 指定；未设置时从最后一条已落盘 assistant 的 `model` / `thinking` 读取，缺少模型则报错（历史记录没有模型时请手动指定）。未提供思考记录时按 `false` 执行。`rag` 生成用 `--model` / `EC_RAG_CONFIG='{"model":"...","thinking":false,"top_k":5}'` 指定，未指定模型时取会话末条 assistant 的 `model`；`top-k` 缺省 5，且只对检索命中生效（无命中不调 LLM）。
 
 新生成的 assistant JSONL 记录保存请求模型、请求思考开关及 `reasoning_effort`、流式推理正文、工具调用、最后一帧 `usage`、结束原因和 EC 观察到的时间与耗时；旧数据不推测缺失字段。渠道只有 `params.upstream.channel_id` 明确提供时记录，**不能把请求的路由意图冒充实际命中渠道**。JSONL 仍是 EC 自有格式，非 Pi JSONL 同构；`usage` 原样保留 ww3 事件字段，不伪造 Pi 的 `cost` / `reasoning` token。
 

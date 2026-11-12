@@ -10,6 +10,7 @@ pub const USAGE: &str = r#"ec-hook — Ever-Context (EC) 滚动上下文管理�
   ec-hook [call|stdio] [--data <插件数据目录>]          默认子命令；ww3 调用入口（stdin JSONL RPC）
   ec-hook manifest [--out <path>]                      输出插件 manifest（ww3 插件注册用）
   ec-hook recall <模式> [参数...]                       检索会话历史 / 目录 / 精华 / 知识库（不调 LLM）
+  ec-hook rag --session <id> --query <问题> --core-data <dir>   检索 top-k 片段交给 LLM 生成带引用的回答
   ec-hook catchup --session <id> --core-data <dir>      旧对话离线追赶：逐段调 LLM 补摘要
   ec-hook ping                                         自检
   ec-hook --help | -h | help                           打印本手册
@@ -33,8 +34,8 @@ call | stdio   —— ww3 Hook 契约入口（每请求一进程，stdin/stdout 
                    识别事件: text.delta / reasoning.delta / tool_call.delta /
                              usage / finish_reason / upstream.end(upstream.done)，
                    其余事件原样透传。
-  request.prepare  一次性。改写入站请求（增量落盘 + 管理区注入 + 硬预算降级 +
-                   注入 ec_recall 工具定义），result = {"request": <改写后的完整请求>}。
+  request.prepare  一次性。改写入站请求（增量落盘 + 管理区注入 + 硬预算降级），
+                   result = {"request": <改写后的完整请求>}。
   initialize       返回 {protocol, plugin_id, manifest, capabilities}
   capabilities.list 返回 {control:[...], conversation:[...]}
   ping             返回 "pong"
@@ -90,6 +91,31 @@ recall  —— 检索（纯本地，不调用 LLM；供人或 LLM 经 bash 调�
   ec-hook recall --add-knowledge --title "ww3 端口" --summary "core 默认 127.0.0.1:7864"
 
 ────────────────────────────────────────────────────────────────────────────
+rag  —— 检索 + LLM 生成（只把相关度最高的 top-k 条片段交给 LLM）
+────────────────────────────────────────────────────────────────────────────
+必填:
+  --session <id>        会话 ID
+  --query <问题>        问题原文（先关键词检索，不做意图拆解）
+  --core-data <dir>     core 数据目录（生成阶段用它 spawn ww3-core）
+
+可选:
+  --top-k <n>           只取相关度最高的 n 条片段，默认 5
+  --model <m>           生成模型（默认：EC_RAG_CONFIG.model → 会话末条 assistant 的 model）
+  --thinking true|false 生成阶段思考开关（默认：EC_RAG_CONFIG.thinking → false）
+  --core <path>         core 可执行文件（默认 ww3-core）
+  --plugins <dir>       透传给 core 的插件目录
+  --data <dir>          EC 数据目录（默认 EC_DATA_ROOT）
+
+行为:
+  1. 用 recall 同一套检索（Tantivy + 分支过滤 + 原文回读）取 top-k；
+  2. 无命中时不调 LLM，直接输出「未找到相关内容」；
+  3. 有命中时把编号片段交给 LLM，要求只依据片段回答、用 [1][2] 标注依据、不足时明说。
+
+示例:
+  ec-hook rag --session 3f2a9c1b7d4e5061 --query "上次为什么改用 jieba？" \
+    --top-k 3 --core ./ww3-core.exe --core-data ./data
+
+────────────────────────────────────────────────────────────────────────────
 catchup  —— 旧对话离线追赶（后台逐段调 LLM 补摘要，推进四态）
 ────────────────────────────────────────────────────────────────────────────
 必填:
@@ -119,6 +145,7 @@ catchup  —— 旧对话离线追赶（后台逐段调 LLM 补摘要，推进�
   EC_DATA_ROOT       数据根目录（回退 WW3_DATA，再回退 .）
   WW3_DATA           同上（ww3 风格命名）
   EC_CATCHUP_CONFIG  catchup 用的 {"model":"...","thinking":false}
+  EC_RAG_CONFIG      rag 用的 {"model":"...","thinking":false,"top_k":5}
   WW3_CORE_EXE       hook 自动 spawn 追赶时用的 core 可执行文件（默认 ww3-core）
   WW3_CORE_DATA      hook 自动 spawn 追赶时用的 core 数据目录
   WW3_PLUGINS_DIR    hook 自动 spawn 追赶时用的插件目录

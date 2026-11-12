@@ -13,7 +13,7 @@
 | 2 | target 10K 可配置 + 统一分段 DRY（segment_records/estimate_record_tokens）+ 增量落盘 + 日常压缩触发 | ✅ 测试通过 |
 | 3 | recall 起止标记 `[EC_RECALL_RESULT]` + directory/highlights/knowledge 命令 + 目录/精华区汰出提示 | ✅ 冒烟验证通过 |
 | 4 | 冗余评估落地：schema v2 title/summary 只索引不 STORED + doc_text（knowledge STORED）+ 召回回读 JSONL | ✅ 测试通过 |
-| 5 | 7 bug 全修：user 落盘 / locate 接线 / 四态推进（advance_states）/ tool_calls 收集 / ec_recall 注入 tools / block_id 稳定化 / 管理区 role=user | ✅ 测试通过 |
+| 5 | 7 bug 全修：user 落盘 / locate 接线 / 四态推进（advance_states）/ tool_calls 收集 / recall 注入 tools / block_id 稳定化 / 管理区 role=user | ✅ 测试通过 |
 
 ## 0. 现状对齐结论（已逐行核对）
 
@@ -36,7 +36,7 @@
 2. **`Store::locate` 未接线**：`store.rs:294` 已实现但 `hook.rs`/`catchup.rs`/`recall.rs` 全只用 `read_leaf`，未用 tail-features 反向链校验定位。
 3. **四态只渲染不推进**：`catchup` 只写 `BlockState::Summary`，IndexOnly/Omitted 无任何代码写入；`projection.rs` 目录区/精华区永远空。
 4. **tool_calls 全程丢失**：`hook.rs:79` `response_tool_calls` 声明后从未 push；`tool_call.delta` 分支只透传不收集。
-5. **ec_recall 未作为 tool 注入 request.tools**：全仓无 tools 写入。
+5. **recall 未作为 tool 注入 request.tools**：全仓无 tools 写入。
 6. **`block_id_of` 内容 hash 跨轮不稳定**：`projection.rs` 用 sha256(title:summary) 截 8 hex，标题/摘要变则 id 变，`rev=blocks.len` 冒充版本。
 7. **管理区 role=system**：`hook.rs` 注入 `role:system`，Pi 版默认 user（注释警告 system 改变 provider 语义）。
 
@@ -49,10 +49,10 @@
 **改动**：
 1. `identity.rs` 新增 `leading_user_anchor(messages) -> String`：跳过前导 system/developer 后，拼接所有 role==user 的消息直到首个非 user（首个 assistant/tool），返回拼接全文（用 `\n` 分隔）。`session_id()` 改用它（原只用第一条 user 全文）。
 2. `budget.rs` `tail_fit_start` 增加首条 user 保护：尾部贴合起点不得越过「首个 assistant 之前」的位置——即 `leading_user_end = 首个非 user 下标`，`tail_start = max(tail_fit_start(...), leading_user_end)`。保证降级后首条 user 区仍在。
-3. 无 JSONL 时裁剪提示词（需求⑧②）：`hook.rs handle_prepare` 超硬线降级分支，若裁掉了前缀（tail_start > leading_user_end），在管理区后追加 `EC_DEGRADED_NOTICE`（含 ec_recall 使用指引 few-shot），话术如下：
+3. 无 JSONL 时裁剪提示词（需求⑧②）：`hook.rs handle_prepare` 超硬线降级分支，若裁掉了前缀（tail_start > leading_user_end），在管理区后追加 `EC_DEGRADED_NOTICE`（含 recall 使用指引 few-shot），话术如下：
    ```
    [EC 提示] 对话前段（约 N 条消息）已从上下文裁剪，当前尚无可用摘要。
-   如需查找早先的内容，可调用 ec_recall 关键词检索，例如：ec_recall query <关键词> --session <session_id>
+   如需查找早先的内容，可调用 recall 关键词检索，例如：recall query <关键词> --session <session_id>
    ```
 
 **验收**：
@@ -67,7 +67,7 @@
 1. `types.rs:225` `target_tokens: 20_000` → `10_000`（`DerivedBudget`）；`config.rs EcConfig` 加 `target_tokens: u32`（默认 10_000），`from_params` 解析；`catchup.rs:54` / `main.rs:89` 默认改 10_000 并优先读 `EcConfig.target_tokens`。
 2. 抽取统一分段器：新增 `ec::chunk` 模块（或并入 `budget.rs`），提供 `segment_chain(chain, cursor, target_tokens) -> Vec<(usize,usize)>`，内部用唯一一套 `estimate_record_tokens`（跳过 recall 结果）。`index.rs index_session` 与 `catchup.rs next_range` 都改用它，删掉各自私有估算函数。
 3. 日常增量压缩入口：`hook.rs` 第 4 步 `compress::decide` 结果不再丢弃——SoftTrigger 时 spawn catchup 子进程（复用现有 `spawn_catchup`，同锁保证单进程）；`decide` 的 `last_compaction_tokens` 改为「祖先链最后一个带 ec 记录之后累计的 token」（用 chain 上 ec 游标精确计算，不用 `块数*20_000` 粗略值）。
-4. 增量估算扣召回：确认 `estimate_record_tokens` 跳过 `name=="ec_recall_result"`（已有），并在 `estimate_prompt_tokens` 层同样跳过（核对 `budget.rs`）。
+4. 增量估算扣召回：确认 `estimate_record_tokens` 跳过 `name=="EC_RECALL_RESULT"`（已有），并在 `estimate_prompt_tokens` 层同样跳过（核对 `budget.rs`）。
 
 **验收**：
 - `cargo test`：`segment_chain` 按 target 切分、跳过 recall；`EcConfig` 解析 target_tokens。
@@ -82,7 +82,7 @@
 2. `main.rs recall` 增加 `--command <query|directory|highlights>`（缺省 query）。`recall.rs` 新增：
    - `directory(session_id, data_root) -> String`：渲染祖先链全部块（含 index_only/omitted）的 `block_id title` 列表。
    - `highlights(session_id, data_root) -> String`：渲染全部块 highlights 去重合并。
-3. `projection.rs` 目录区/精华区汰出提示：精华区按 budget 裁剪后有剩余时，末尾加 `(还有 N 条精华已汰出，可用 ec_recall highlights --session xxx 获取)`；目录区 omitted 提示已有，补充 directory 命令指引。
+3. `projection.rs` 目录区/精华区汰出提示：精华区按 budget 裁剪后有剩余时，末尾加 `(还有 N 条精华已汰出，可用 recall highlights --session xxx 获取)`；目录区 omitted 提示已有，补充 directory 命令指引。
 4. knowledge 落地：`index.rs` 新增 `index_knowledge` + `search_knowledge`（跨 session，doc_type=`knowledge`）；`main.rs` 加 `knowledge-add`/`knowledge-search` 子命令（或并入 recall `--command knowledge --query`）。索引 doc_type 过滤参数化：`search` 的 `doc_type` 参数已支持，knowledge 检索传 `"knowledge"` 且 session_id 传空（不过滤会话）。
 
 **验收**：
@@ -108,7 +108,7 @@
 2. **`locate` 接线**：`handle_prepare` 用 `store.locate(session_id, tail_features)` 替代「仅 read_leaf」定位（leaf 为空或 locate 更精确时）；`recall.rs`/`catchup.rs` 保持 read_leaf（有 leaf 文件时足够）。
 3. **四态推进**：新增 `ec::roll` 逻辑（或在 `catchup` 补块后调用）：摘要区超 summary_budget 时把最旧 summary 块降 index_only，目录区超 directory_budget 时把最旧 index_only 降 omitted。写回 `set_ec`。
 4. **tool_calls 收集**：`hook.rs` `tool_call.delta` 分支按 id 聚合 name/arguments 进 `response_tool_calls`；assistant 记录带 tool_calls 落盘。
-5. **ec_recall 注入 tools**：`handle_prepare` 改写 request 时把 `tools` 数组追加 `ec_recall` 函数定义（若 request 无 tools 则新建）。
+5. **recall 注入 tools**：`handle_prepare` 改写 request 时把 `tools` 数组追加 `recall` 函数定义（若 request 无 tools 则新建）。
 6. **block_id 稳定化**：`projection.rs` 改用「记录 id（message_id）」作 block_id（锚定 ec 挂载点，跨轮稳定），`rev` 用「带 ec 记录的 message_id 集合」派生稳定值或直接用 `blocks.len` 但注释说明语义。
 7. **管理区 role 改 user**：`hook.rs` 管理区注入消息 role 从 `system` 改 `user`（对齐 Pi 版，避免 provider 语义问题）；硬线提示已是 user。
 
@@ -129,7 +129,7 @@
 ## 3. 失败回退
 
 - 每阶段改动集中在独立模块/函数，`git` 无版本控制（本仓库未 init）——**每阶段开始前 `cp -r` 备份 `src/` 到 `docs/.backup/stage-N/`**，失败可整体回退。
-- 行为开关：`EcConfig.enabled` 已是 fail-open 总开关；新增能力（ec_recall 注入、增量压缩 spawn）失败时记日志不阻断主流程（保持 fail-open 原则）。
+- 行为开关：`EcConfig.enabled` 已是 fail-open 总开关；新增能力（recall 注入、增量压缩 spawn）失败时记日志不阻断主流程（保持 fail-open 原则）。
 
 ## 4. 不在本次范围
 
@@ -156,7 +156,7 @@
 | `build_summary_call(chain,start,end,mode,full_max)` | 唯一请求构造入口。FullContext＝喂 `[0..end]` 完整前缀 + 本段首条原文的唯一锚点（`unique_boundary_quote`），模型只压锚点之后；锚点不唯一或前缀超 `full_max` 自动降级 Fragment |
 | `run_summary_call(client,model,call)` | 唯一执行入口，`chat(..., false)` 显式关思考；返回上游 `ChatResult` + 解析产物 |
 | `unique_quote_in / unique_boundary_quote` | 对齐 Pi `ec-boundary.ts:145/163`（最短唯一前缀，min 48 / max 512 字节，UTF-8 边界对齐） |
-| `SUMMARY_SYSTEM_PROMPT[_FULLCONTEXT]` | 片段 / 全上下文两版提示词（后者要求「只压缩锚点之后」并忽略 `ec_recall_result`） |
+| `SUMMARY_SYSTEM_PROMPT[_FULLCONTEXT]` | 片段 / 全上下文两版提示词（后者要求「只压缩锚点之后」并忽略 `EC_RECALL_RESULT`） |
 
 `catchup::CatchupConfig` 新增 `summary_mode`（默认 full_context）与 `full_context_max_tokens`
 （默认 60000）；CLI 新增 `--summary-mode fragment|full_context`、`--full-context-max-tokens`。

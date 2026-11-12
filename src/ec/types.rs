@@ -53,7 +53,7 @@ pub struct MessageRecord {
     /// tool_result 的工具名（可选，用于 feature_text 与防篡改审计）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
-    /// 消息名（OpenAI 的 name 字段；投影注入消息用它标记 ec_meta / ec_recall_result）。
+    /// 消息名（OpenAI 的 name 字段；EC 注入的投影消息用它标记 ec_meta / ec_management）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// 投影产物（可选）：压缩结果挂在与触发压缩同一行的记录上。

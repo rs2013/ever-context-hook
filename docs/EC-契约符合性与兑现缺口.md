@@ -103,9 +103,9 @@
 | # | 承诺 / 预期 | 现状 | 缺口 |
 | --- | --- | --- | --- |
 | G-4 | 三个可配置 LLM：`compact` / `catchup` / `rag` | `compact` 已接线；`catchup` 配置项存在但**无消费者**（`spawn_catchup` 一律用 compact，手工 CLI 只认 `--model` / `EC_CATCHUP_CONFIG`）；`rag` 未实现 | 需先定义「哪条触发路径算旧对话追赶」；建议：`spawn_catchup` 传入 `EC_CATCHUP_CONFIG`（由 `cfg.ec.catchup` 序列化），并让 `--model` 仅在 compact 显式配置时才传 |
-| G-5 | 检索增强生成（RAG）：检索 + LLM 生成答案 | 只有 `recall`（直接检索）；无 `rag` 子命令、无 `rag.model` 消费点 | 按已定方案：Tantivy 直接检索 → 组 prompt → 调 LLM 生成 |
+| G-5 | 检索增强生成（RAG）：检索 + LLM 生成答案 | ✅ **已实现** `ec-hook rag --session --query --top-k --core-data`：`ec/rag.rs` 取相关度最高 top-k（默认 5，可 `--top-k` 或 `EC_RAG_CONFIG.top_k` 覆盖），组编号片段 prompt 交 LLM，要求只依据片段并给出 `[1][2]` 引用；无命中不调 LLM | 剩余：跨会话 knowledge 的生成式回答未接（只有 `recall --knowledge` 纯检索） |
 | G-6 | 上游失败信息可用于决策 | `upstream.end` 的 `kind`/`message` 未读；hook 只记 `ok` | 落盘/日志带上上游错误分类，便于 fail-open 判定与复盘 |
-| G-7 | 工具/技能注入让模型能用 `ec_recall` | 仍以 **function calling** 方式注入 `ec_recall` 到 `request.tools`（`hook.rs:ec_recall_tool_def`），而 ww3/下游并无该工具的本地执行器 → 模型"看得见调不动" | 按既定结论：移除 tools 注入，改为在管理区/提示中说明 `ec-hook recall ...` 的 bash 用法（或提供 skill 文件） |
+| G-7 | 模型能用上检索能力 | ✅ **已修正**：移除 function calling 工具注入（相关定义已删），改为在管理区汰出提示 / 硬线降级提示里注入**本机二进制真实路径**的 CLI 用法（`ec::bin_hint()`），并在 `docs/EC-CLI使用说明.md §10.1` 给出 skill 文本模板 | 术语统一：只用 `recall` / `rag`，不再出现工具名；历史 JSONL 的旧 `name` 值仅作向后兼容识别 |
 | G-8 | 四态推进随实际模型窗口 | `catchup` 用 `WindowConfig::default()` | 改为按会话模型/`ec.context_window` 推导 |
 
 ### P2 — 工程质量
@@ -130,3 +130,6 @@
 6. `capabilities.control` 改为如实声明（移除未实现的 `config.schema` / `config.get`）。
 7. 删除冗余配置 `fail_open`（契约里由 core 的 `hooks[].fail_open` 决定，插件侧无权自决）。
 8. 死代码清零：`cargo build` 0 warning；脚本扫描「仅测试内使用 / 仅定义」的顶层函数为 0。
+9. **RAG 生成能力**（P1 G-5）：新增 `ec-hook rag`，`top-k` 可配（`--top-k` / `EC_RAG_CONFIG.top_k`，默认 5），无命中不调 LLM。
+10. **检索术语归一**（P1 G-7）：删除 function calling 工具注入，模型侧改为 bash 调 CLI；提示文本注入二进制真实路径；全部文档统一用 `recall` / `rag`，工具形态术语废弃（代码仅留向后兼容识别）。
+11. 附带：删除失效配置键 `growth_nudge` / `pressure_threshold`（e2e 配置同步）；默认日志过滤调为 `info,tantivy=warn`，避免索引内部 INFO 污染 stderr。

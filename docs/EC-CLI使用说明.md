@@ -52,6 +52,7 @@ exit 2
 | `EC_DATA_ROOT` | 数据根目录（JSONL + 索引） | 回退 `WW3_DATA`，再回退 `.` |
 | `WW3_DATA` | 同上，ww3 风格命名 | `.` |
 | `EC_CATCHUP_CONFIG` | 只有 `catchup` 用：`{"model":"...","thinking":false}` 的 JSON，作为 `--model/--thinking` 的兜底 | 无 |
+| `EC_RAG_CONFIG` | 只有 `rag` 用：`{"model":"...","thinking":false,"top_k":5}`，作为 `--model/--thinking/--top-k` 的兜底 | 无 |
 | `WW3_CORE_EXE` | hook 自动 spawn 追赶时用：ww3-core 可执行文件 | `ww3-core` |
 | `WW3_CORE_DATA` | hook 自动 spawn 追赶时用：core 数据目录 | `<data_root>/../../` |
 | `WW3_PLUGINS_DIR` | hook 自动 spawn 追赶时用：插件目录 | `<data_root>/../` |
@@ -112,7 +113,7 @@ ec-hook [call|stdio] [--data <插件数据目录>]
 
 | method | 语义 | 返回 |
 | --- | --- | --- |
-| `request.prepare` | **一次性**：改写入站请求（落盘增量 + 注入管理区 + 硬预算降级 + 注入工具定义） | `result` 帧，`result = {"request": <改写后的完整请求>}`；失败 `error.kind=bad_params` |
+| `request.prepare` | **一次性**：改写入站请求（落盘增量 + 注入管理区 + 硬预算降级；不注入 tools） | `result` 帧，`result = {"request": <改写后的完整请求>}`；失败 `error.kind=bad_params` |
 | `hook.stream` | **双向流**：透传上游事件，收集 assistant 回复并在 `upstream.end` 后落盘 | `result` 帧，`ok=true/false` |
 | `initialize` | 握手 | `{protocol:1, plugin_id, manifest, capabilities}` |
 | `capabilities.list` | 能力清单 | `{control:[...], conversation:[...]}` |
@@ -235,7 +236,52 @@ ec-hook recall --add-knowledge --title "ww3 端口" --summary "core 默认监听
 
 ---
 
-## 5. `catchup` — 旧对话离线追赶（后台逐段调 LLM 补摘要）
+## 5. `rag` — 检索 + LLM 生成（只把 top-k 条交给模型）
+
+```
+ec-hook rag --session <id> --query <问题> --core-data <dir>
+            [--top-k <n>] [--model <m>] [--thinking true|false]
+            [--core <path>] [--plugins <dir>] [--data <dir>]
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `--session <id>` | ✅ | — | 会话 ID |
+| `--query <问题>` | ✅ | — | 问题原文（先做关键词检索，不做 LLM 意图拆解） |
+| `--core-data <dir>` | ✅ | — | core 数据目录（生成阶段 `ww3-core stdio --hooks none` 用） |
+| `--top-k <n>` | 否 | `5` | **只取相关度最高的 n 条片段**交给 LLM |
+| `--model <m>` | 否 | 见下 | 生成模型 |
+| `--thinking <bool>` | 否 | 见下 | 生成阶段思考开关 |
+| `--core <path>` | 否 | `ww3-core` | core 可执行文件 |
+| `--plugins <dir>` | 否 | `""` | 透传给 core |
+| `--data <dir>` | 否 | `EC_DATA_ROOT` | EC 数据目录 |
+
+兜底顺序：
+
+```
+--top-k   → EC_RAG_CONFIG.top_k → 5
+--model   → EC_RAG_CONFIG.model → 会话末条 assistant 的 model
+--thinking→ 显式值 → EC_RAG_CONFIG.thinking → false
+```
+
+行为：
+
+1. 用与 `recall` **同一套检索**（Tantivy 召回 + 分支过滤 + 按 `path/start_line/end_line` 回读原文）取 top-k；
+2. **无命中时不调 LLM**，直接输出「未在当前会话历史中找到与问题相关的内容。」；
+3. 有命中时把编号片段（`[1] 标题 (block_id, 行 a-b)` + 摘要 + 原文，单条原文上限 4000 字符）交给 LLM，
+   system 规则要求：只依据片段回答、用 `[1][2]` 标注依据、片段不足时明说；
+4. 模型缺失且确有命中 → 报错 `缺少生成模型`，exit 1。
+
+示例：
+
+```bash
+ec-hook rag --session 3f2a9c1b7d4e5061 --query "上次为什么改用 jieba？"   --top-k 3 --core ./ww3-core.exe --core-data ./data
+```
+
+> 注：索引不可用时 `recall` 会退化到内存检索，此时命中只有摘要、**没有原文行号**（`行 0-0`），
+> RAG 的片段质量会相应下降；建索引由 `request.prepare` 自动完成。
+
+## 6. `catchup` — 旧对话离线追赶（后台逐段调 LLM 补摘要）
 
 ```
 ec-hook catchup --session <id> --core-data <core数据目录>
@@ -285,7 +331,7 @@ ec-hook catchup \
 
 ---
 
-## 6. `ping`
+## 7. `ping`
 
 ```
 ec-hook ping
@@ -295,7 +341,7 @@ ec-hook ping
 
 ---
 
-## 7. 插件配置（`hooks[].config`，由 ww3 下发）
+## 8. 插件配置（`hooks[].config`，由 ww3 下发）
 
 `EcConfig` 实际接受的键（`serde` 默认忽略未知键，写错不报错）：
 
@@ -315,10 +361,10 @@ ec-hook ping
 
 ---
 
-## 8. 已知限制清单（按影响排序）
+## 9. 已知限制清单（按影响排序）
 
-1. `catchup.*` 插件配置尚未接线：自动 spawn 一律用 `compact` 模型，手工追赶用 CLI `--model`。
-2. `recall` 不调 LLM；RAG（`rag.model` + 生成式回答）只有设计，未实现，因此没有 `rag` 子命令。
+1. `catchup.*` 插件配置尚未接线：自动 spawn 一律用 `compact` 模型，手工追赶用 CLI `--model`；`rag.*` 同理，目前只认 CLI 参数与 `EC_RAG_CONFIG`。
+2. `rag` 仅检索**本会话**（祖先链）；跨会话知识库的生成式回答尚未接入（`--knowledge` 只有纯检索）。
 3. `catchup` 四态推进目前用 `WindowConfig::default()`，不随实际模型窗口变化。
 4. 并发写保护：`append`/`import_messages`/`update_leaf` 仍未纳入同一把会话写锁（评审 P0 项，未修）。
 5. `core_client` 无请求超时；锁 30 分钟过期且无心跳。
@@ -326,7 +372,7 @@ ec-hook ping
 
 ---
 
-## 9. 与你预期核对用的自检清单
+## 10. 与你预期核对用的自检清单
 
 - [ ] 二进制名 `ec-hook`（`target/release/ec-hook.exe`），ww3 侧只需 `["call","--data","<插件数据目录>"]`
 - [ ] `--help` / `-h` / `help` 打印手册，`--version` / `-V` 打印版本
@@ -335,8 +381,32 @@ ec-hook ping
 - [ ] 未知方法返回 `not_found` 而非崩溃
 - [ ] 五个子命令：`call`(默认) / `manifest` / `recall` / `catchup` / `ping`
 - [ ] `recall` 五模式与优先级：`--add-knowledge` > `--knowledge` > `--directory` > `--highlights` > 默认
+- [ ] `rag` 只把 top-k 条交给 LLM；无命中不调 LLM；顶层 `--top-k` / `EC_RAG_CONFIG.top_k` 可覆盖
 - [ ] `recall` 默认与 `--knowledge` 需要 `--query`；`--directory`/`--highlights`/默认 需要 `--session`
 - [ ] `catchup` 必填 `--session` + `--core-data`，模型兜底链三段
 - [ ] 退出码 0/1/2 语义
 - [ ] stdout 只出 RPC 帧或正文，日志全在 stderr
 - [ ] 数据落在 `<EC_DATA_ROOT>/sessions/<session_id>.jsonl` + `<EC_DATA_ROOT>/index/`
+
+### 10.1 模型侧使用提示（skill 文本模板）
+
+给模型看的说明里**直接写 `ec-hook` 的真实绝对路径**（hook 注入的管理区/降级提示就是这么做的，
+见 `ec::bin_hint()`），不要写工具名：
+
+```markdown
+## 历史检索
+
+需要查找已经滚出上下文的早先内容时，用 bash 执行（路径以本机安装为准）：
+
+- 关键词检索：`<EC_HOOK_PATH> recall --session <session_id> --query "<关键词>"`
+- 完整目录：  `<EC_HOOK_PATH> recall --session <session_id> --directory`
+- 完整精华：  `<EC_HOOK_PATH> recall --session <session_id> --highlights`
+- 直接问答：  `<EC_HOOK_PATH> rag --session <session_id> --query "<问题>" --core-data <core数据目录>`
+
+`recall` 只检索、结果包在 `[EC_RECALL_RESULT]` … `[/EC_RECALL_RESULT]` 里（这类内容不计入压缩预算）；
+`rag` 会先检索 top-k 再让模型给出带 `[1][2]` 引用的回答。
+```
+
+> 术语约定：本仓库只用 **`recall`** 指代「检索」，用 **`rag`** 指代「检索 + 生成」，
+> 不引入任何"工具名"概念。早期工具形态的命名已废弃；代码里只保留对历史 JSONL 的向后兼容识别
+> （按正文 `[EC_RECALL_RESULT]` 标记判断召回内容）。

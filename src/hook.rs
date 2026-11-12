@@ -344,14 +344,12 @@ pub fn handle_prepare(_req_id: &str, params: &serde_json::Value) -> Result<serde
     // 2. 构建管理区
     let management = ec::projection::build_management_area(&chain, &cfg.window, &cfg.session_id);
     let mgmt_chars = management.len(); // 先取长度：下面 json! 会移动 management
-    // 管理区与注入工具同样占用 prompt 预算；估算必须计入，否则实际 prompt 可能超硬线。
+    // 管理区占用 prompt 预算；估算必须计入，否则实际 prompt 可能超硬线。
     let management_tokens = ec::projection::estimate_management_tokens(&chain, &cfg.window, &cfg.session_id);
-    let tools_tokens = ec::budget::estimate_json_tokens(&ec_recall_tool_def());
 
-    // 3. 预算检查：估算全量 prompt token（原生 messages + 管理区 + 注入工具）
+    // 3. 预算检查：估算全量 prompt token（原生 messages + 管理区）
     let projected = ec::budget::estimate_prompt_tokens(&cfg.messages)
-        .saturating_add(management_tokens)
-        .saturating_add(tools_tokens);
+        .saturating_add(management_tokens);
     let hard_budget = cfg.window.hard_budget;
     let degrade_target = cfg.window.budget.degrade_target;
     let over_hard = projected > hard_budget;
@@ -393,7 +391,11 @@ pub fn handle_prepare(_req_id: &str, params: &serde_json::Value) -> Result<serde
         // degrade_target = soft_threshold × degrade_target_ratio（默认 0.6），比硬预算更激进，
         // 避免每轮新内容都重新触发降级（留出余量让日常增长交回压缩维护）。
         // 无摘要块时用降级提示词（带 few-shot），有摘要块时用硬线提示词
-        let notice = if management.is_empty() { DEGRADED_NOTICE } else { HARD_LINE_NOTICE };
+        let notice = if management.is_empty() {
+            degraded_notice(&cfg.session_id)
+        } else {
+            hard_line_notice(&cfg.session_id)
+        };
         let notice_tokens = (notice.len() as f64 / 3.0).ceil() as u32 + 4;
         let sys_tokens: u32 = msgs[..sys_end].iter().map(ec::budget::estimate_message_tokens).sum();
         let room = degrade_target
@@ -438,64 +440,40 @@ pub fn handle_prepare(_req_id: &str, params: &serde_json::Value) -> Result<serde
     }
     new_req["messages"] = serde_json::Value::Array(new_msgs);
 
-    // bug ⑤ 修复：注入 ec_recall 工具定义（模型可通过 function calling 主动召回）。
-    // 幂等：已存在则跳过，避免每轮重复追加。
-    if let Some(req_obj) = new_req.as_object_mut() {
-        let tools = req_obj.entry("tools").or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let Some(arr) = tools.as_array_mut() {
-            let exists = arr.iter().any(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) == Some("ec_recall"));
-            if !exists {
-                arr.push(ec_recall_tool_def());
-            }
-        }
-    }
+    // 不再注入 function calling 工具定义：
+    // 下游/ww3 并无该工具的执行器，注入只会让模型“看得见调不动”。
+    // 改为在管理区/降级提示中给出可执行的 CLI 路径（见 ec::bin_hint）。
 
     // 复盘 trace（INFO）：一轮 request.prepare 的完整决策量，便于事后回放 EC 行为。
     log::info!("[ec-prepare-trace] session={} leaf={} chain={} unsummarized_tokens={} projected={} soft={} hard={} management_chars={} over_hard={} tail_start={} tools={}",
         cfg.session_id, leaf.as_deref().unwrap_or("-"), chain.len(), unsummarized_tokens, projected,
         cfg.window.budget.soft_threshold, hard_budget, mgmt_chars, over_hard,
         dbg_tail_start.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-        new_req["tools"].as_array().map(|a| a.len()).unwrap_or(0));
-    log::info!("[ec-prepare] 投影完成：原始 {} 条 -> 投影 {} 条（硬线降级={}）",
+        new_req["tools"].as_array().map(|a| a.len()).unwrap_or(0));    log::info!("[ec-prepare] 投影完成：原始 {} 条 -> 投影 {} 条（硬线降级={}）",
         msgs.len(), new_req["messages"].as_array().map(|a| a.len()).unwrap_or(0), over_hard);
     // 契约：result 返回 {"request": 改写后的完整请求}（与 ww3 PrepareResult 对齐）
     Ok(serde_json::json!({ "request": new_req }))
 }
 
-/// 硬线降级提示（对齐 Pi 版 EC_HARD_LINE_NOTICE）：告诉模型有历史滚出，可用 ec_recall 召回。
-pub const HARD_LINE_NOTICE: &str = "[EC 提示] 本对话历史较长，早期内容已从当前上下文滚出（仍保留在本地索引中）。如需查找早先的决策、约束或结果，请使用 ec_recall 工具检索，不要假定这些内容仍然可见。";
+/// 硬线降级提示：历史已滚出，给出**可执行**的 CLI 路径（不假定下游有对应工具）。
+pub fn hard_line_notice(session_id: &str) -> String {
+    let bin = ec::bin_hint();
+    format!(
+        "[EC 提示] 本对话历史较长，早期内容已从当前上下文滚出（仍保留在本地索引中）。\
+如需查找早先的决策、约束或结果，可用 bash 执行：\n  {bin} recall --session {session_id} --query <关键词>\n\
+  {bin} rag --session {session_id} --query <问题> --core-data <core数据目录>\n\
+不要假定这些内容仍然可见。"
+    )
+}
 
-/// 降级提示词（无摘要块时用）：告诉模型历史已裁剪、当前暂无可检索摘要，给出 ec_recall 检索样例。
-pub const DEGRADED_NOTICE: &str = "[EC 提示] 本对话历史较长，早期内容已从当前上下文裁剪，且当前暂无可用摘要（压缩维护尚未完成）。如需查找早先的内容，可使用 ec_recall 关键词检索，例如：ec_recall query <关键词> --session <session_id>";
-
-/// ec_recall 工具定义（bug ⑤ 修复）：注入 request.tools，模型可通过 function calling 主动召回。
-pub fn ec_recall_tool_def() -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "ec_recall",
-            "description": "检索已从当前上下文滚出的本对话历史或全局知识库。用于查找早先的决策、约束、结果、凭据等。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["query", "directory", "highlights", "knowledge"],
-                        "description": "query=关键词检索本会话历史；directory=列出全部压缩块标题；highlights=列出全部精华；knowledge=检索全局知识库"
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "关键词（command=query 或 knowledge 时必填）"
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "会话 ID（检索本会话时可省略；跨会话需显式指定）"
-                    }
-                },
-                "required": ["command"]
-            }
-        }
-    })
+/// 降级提示词（无摘要块时用）：历史已裁剪且暂无摘要，给出检索样本。
+pub fn degraded_notice(session_id: &str) -> String {
+    let bin = ec::bin_hint();
+    format!(
+        "[EC 提示] 本对话历史较长，早期内容已从当前上下文裁剪，且当前暂无可用摘要（压缩维护尚未完成）。\
+如需查找早先内容，可用 bash 执行：\n  {bin} recall --session {session_id} --query <关键词>\n\
+不要假定这些内容仍然可见。"
+    )
 }
 
 /// spawn 一个 detach 的索引追赶子进程（ec-hook 自身 catchup 子命令）。

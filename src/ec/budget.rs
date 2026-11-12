@@ -7,7 +7,7 @@
 //!
 //! ## 关键规则：召回内容不计入增量
 //!
-//! recall 召回的内容（`name == "ec_recall_result"`）**必须跳过**，
+//! recall 召回的内容（正文含 `[EC_RECALL_RESULT]` 标记）**必须跳过**，
 //! 否则全文召回一次 +10K token 会立刻触发又一次压缩（无新内容，浪费 + 死循环）。
 
 use crate::ec::identity::is_recall_result;
@@ -15,7 +15,7 @@ use crate::ec::types::ChatMessage;
 
 /// 估算 prompt 的 token 数（粗估：字符数 ÷ 3）。
 ///
-/// **跳过 recall 结果消息**（`name == "ec_recall_result"`）——它们的 token 不计入增量。
+/// **跳过 recall 结果消息**（正文含 `[EC_RECALL_RESULT]` 标记）——它们的 token 不计入增量。
 pub fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
     let mut total = 0u32;
     for m in messages {
@@ -32,12 +32,6 @@ pub fn estimate_prompt_tokens(messages: &[ChatMessage]) -> u32 {
         }
     }
     total
-}
-
-/// 估算任意 JSON 值（如工具定义）的 token：序列化长度 ÷ 3 + 结构开销。
-pub fn estimate_json_tokens(v: &serde_json::Value) -> u32 {
-    let len = serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
-    if len == 0 { 0 } else { ((len as f64) / 3.0).ceil() as u32 + 8 }
 }
 
 /// 锚定区 + 尾部贴合：返回 (锚定区结束下标, 尾部窗口起点)。
@@ -71,9 +65,9 @@ pub fn estimate_message_tokens(m: &ChatMessage) -> u32 {
 /// 估算单条 MessageRecord 的 token（正文 + 工具调用，粗估 utf8/3）。
 ///
 /// 统一的持久化记录估算（index.rs / catchup.rs 共用，DRY）。
-/// 跳过 recall 结果（`name == "ec_recall_result"`）。
+/// 跳过 recall 结果（正文含 `[EC_RECALL_RESULT]` 标记）。
 pub fn estimate_record_tokens(r: &crate::ec::types::MessageRecord) -> u32 {
-    if r.name.as_deref() == Some("ec_recall_result") {
+    if r.name.as_deref() == Some("ec_recall_result") || r.content.contains(crate::ec::identity::EC_RECALL_MARKER) {
         return 0;
     }
     let mut t = 4u32;
@@ -161,15 +155,16 @@ mod tests {
             content: MessageContent::Text(content.to_string()),
             tool_calls: vec![],
             tool_call_id: Some("call_x".to_string()),
-            name: Some("ec_recall_result".to_string()),
+            name: None,
         }
     }
 
     #[test]
     fn test_estimate_skips_recall() {
+        // 新形态：bash 调 recall 的产出，靠正文标记识别（不再依赖 name 字段）
         let msgs = vec![
             msg("user", "帮我写函数"),
-            recall_msg("这是一大段召回的全文，占 10K token 的内容"),
+            recall_msg("[EC_RECALL_RESULT]\n找到 1 条……\n[/EC_RECALL_RESULT]"),
         ];
         let tokens = estimate_prompt_tokens(&msgs);
         // recall 消息被跳过，只剩 user 消息（4 + content/3）
@@ -191,10 +186,5 @@ mod tests {
         assert_eq!(anchor_end, 2, "锚定区应结束于首条 user 之后");
         assert_eq!(msgs[1].role, "user");
         assert!(tail_start >= anchor_end, "尾部窗口不得回退进锚定区");
-    }
-
-    #[test]
-    fn test_estimate_json_tokens_positive() {
-        assert!(estimate_json_tokens(&serde_json::json!({"name":"ec_recall"})) > 0);
     }
 }

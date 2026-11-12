@@ -287,7 +287,7 @@ impl Store {
     /// 用于「新对话首次遇到」：首条 user 找不到对应 JSONL 时，把请求里的全部
     /// 原生消息逐条转成 MessageRecord（message_id + parent_id 链），并更新叶子。
     ///
-    /// 跳过投影消息（ec_meta / ec_management / ec_recall_result）——它们不是原生对话。
+    /// 跳过投影消息（ec_meta / ec_management）——它们不是原生对话。
     /// 返回导入的记录数（幂等：已存在的记录跳过）。
     pub fn import_messages(&self, session_id: &str, messages: &[ChatMessage]) -> Result<usize, StoreError> {
         // 逐条转换，维护 parent 链

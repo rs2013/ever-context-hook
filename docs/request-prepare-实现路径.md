@@ -8,11 +8,11 @@
 
 | 修改点 | 内容 | 大小 |
 |--------|------|------|
-| `messages` 前插入一条 system 消息 | 管理区投影（长期契约 + 历史块摘要 + ec_recall 提示） | ~800–2000 token |
-| `tools` 数组追加 | `ec_recall` 函数定义 | ~200 token |
-| 首条 system 消息增强 | 追加 EC 指令（"对话已压缩，用 ec_recall 召回"） | ~100 token |
+| `messages` 前插入一条 system 消息 | 管理区投影（长期契约 + 历史块摘要 + recall 提示） | ~800–2000 token |
+| `tools` 数组追加 | `recall` 函数定义 | ~200 token |
+| 首条 system 消息增强 | 追加 EC 指令（"对话已压缩，用 recall 召回"） | ~100 token |
 
-合计约 1.1–2.3K token，远小于上下文窗口，但**对 EC 机制是必需的**——没有管理区投影，模型看不到历史摘要；没有 ec_recall 工具，模型无法主动召回。
+合计约 1.1–2.3K token，远小于上下文窗口，但**对 EC 机制是必需的**——没有管理区投影，模型看不到历史摘要；没有 recall 工具，模型无法主动召回。
 
 ## 三种实现路径
 
@@ -40,7 +40,7 @@ hook ──result({ok: true})─────────────────
 {"op": "request", "patch": {
   "messages.prepend": [{"role": "system", "content": "管理区..."}],
   "tools.append": [{"type": "function", "function": {...}}],
-  "system.landing": "使用 ec_recall 工具搜索已压缩的历史内容。"
+  "system.landing": "使用 recall 工具搜索已压缩的历史内容。"
 }}
 
 // core 回复（确认改写已应用）
@@ -170,7 +170,7 @@ core 收到后回复 `{"op": "ack", "ok": true}`，然后开始 push 事件。
 // ── Phase 1: 请求前处理 ──
 // 1. 计算管理区投影
 let mgmt = ec::projection::build_management_area(session.ec_state.as_ref());
-let ec_recall_tool = ec::projection::ec_recall_tool_def();
+let recall_tool = ec::projection::recall_tool_def();
 
 // 2. 发 request 帧给 core
 let patch = serde_json::json!({
@@ -179,7 +179,7 @@ let patch = serde_json::json!({
         "content": mgmt,
         "name": "ever_context"  // 标记以便后续识别
     }],
-    "tools.append": [ec_recall_tool],
+    "tools.append": [recall_tool],
 });
 s.request_patch(&patch)?;
 

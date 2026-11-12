@@ -23,7 +23,9 @@
 //!
 //! - `call`：ww3 hook.stream 的一次调用（core 每请求 spawn 一次）
 //! - `manifest`：输出 manifest.json
-//! - `recall`：ec-recall CLI（LLM 通过 skill 注入调用，搜索会话历史）
+//! - `recall`：检索 CLI（纯本地，不调 LLM）
+//! - `rag`：检索 + LLM 生成带引用的回答（top-k 可配）
+//! - `catchup`：旧对话离线追赶压缩
 //! - `ping`：自检
 
 mod ec;
@@ -35,7 +37,8 @@ use std::env;
 use std::process;
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    // 默认过滤 info，但把 tantivy 降到 warn：索引 open/commit 的内部 INFO 会污染 stderr。
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tantivy=warn"))
         .format_timestamp_millis()
         .init();
 
@@ -77,7 +80,7 @@ fn main() {
             }
         }
         "recall" => {
-            // ec-recall CLI：LLM 通过 skill 注入调用
+            // recall CLI：模型通过 bash 调用（不调 LLM）
             // 用法:
             //   本会话检索:   ever-context-hook recall --session <id> [--query <q>] [--limit <n>]
             //   完整目录:     ever-context-hook recall --directory --session <id>
@@ -134,6 +137,52 @@ fn main() {
                 }
                 let hits = ec::recall::search(&session, &query, limit, &data_root);
                 println!("{}", ec::recall::format_hits(&hits));
+            }
+        }
+        "rag" => {
+            // 检索 + 生成：取相关度最高的 top-k 条片段交给 LLM，生成带引用的回答。
+            // 用法: ec-hook rag --session <id> --query <问题> --core-data <dir> [--top-k <n>] ...
+            let env_cfg = env::var("EC_RAG_CONFIG").ok()
+                .and_then(|v| serde_json::from_str::<ec::rag::RagEnvConfig>(&v).ok())
+                .unwrap_or_default();
+            let session = arg_value(&args, "--session").unwrap_or_default();
+            let query = arg_value(&args, "--query").unwrap_or_default();
+            let data_root = arg_value(&args, "--data")
+                .or_else(|| env::var("EC_DATA_ROOT").ok()).unwrap_or_default();
+            let core_data = arg_value(&args, "--core-data").unwrap_or_default();
+            let top_k = arg_value(&args, "--top-k").and_then(|v| v.parse().ok())
+                .or(env_cfg.top_k).unwrap_or(5);
+            let thinking = match arg_value(&args, "--thinking").as_deref() {
+                Some("true") => true,
+                Some("false") => false,
+                Some(other) => { eprintln!("未知 --thinking: {other}（可选 true|false）"); process::exit(2); }
+                None => env_cfg.thinking.unwrap_or(false),
+            };
+            // 模型兜底：--model → EC_RAG_CONFIG.model → 会话末条 assistant 的 model
+            let model = arg_value(&args, "--model").or(env_cfg.model.clone()).unwrap_or_else(|| {
+                let store = ec::store::Store::new(&data_root);
+                store.read_leaf(&session).and_then(|leaf| store.load_chain(&session, &leaf).ok())
+                    .and_then(|chain| chain.into_iter().rev().find_map(|r| (r.role == "assistant").then_some(r.model).flatten()))
+                    .unwrap_or_default()
+            });
+            if session.is_empty() || query.is_empty() || core_data.is_empty() {
+                eprintln!("用法: ec-hook rag --session <id> --query <问题> --core-data <core数据目录> [--top-k <n>] [--model <模型>] [--thinking true|false] [--core <路径>] [--plugins <目录>]");
+                process::exit(2);
+            }
+            let cfg = ec::rag::RagConfig {
+                session_id: session,
+                query,
+                top_k,
+                data_root,
+                model,
+                thinking,
+                core_exe: arg_value(&args, "--core").unwrap_or_else(|| "ww3-core".to_string()),
+                core_data,
+                plugins_dir: arg_value(&args, "--plugins").unwrap_or_default(),
+            };
+            match ec::rag::run(&cfg) {
+                Ok(answer) => println!("{answer}"),
+                Err(e) => { eprintln!("[ec-rag] 失败: {e}"); process::exit(1); }
             }
         }
         "catchup" => {

@@ -42,7 +42,7 @@
 - trace：`unsummarized_tokens=20991 projected=22224 soft=100000 hard=103424 management_chars=4247 over_hard=false tail_start=- tools=1`
 
 ### 1.4 继续对话（追加 1 条新 user 后重新 prepare）
-- 原始 41 → 投影 42 条；`tools=['ec_recall']`（工具注入生效）
+- 原始 41 → 投影 42 条；`tools=['recall']`（工具注入生效）
 - JSONL：记录数 40→41，末条 role=user，**首条 id `cd16ac85a73feafe` 保持不变**（content-addressed 幂等正确）
 
 ### 1.5 召回校验（全部可用）
@@ -84,7 +84,7 @@
 
 ## 3. 旧对话在 EC 中的表现小结
 
-1. **机制全部可用**：建档导入、规则分段建索引、LLM 逐段摘要、管理区注入（目录/精华/摘要）、四态记录、`ec_recall` 工具注入与召回（query/directory/highlights/knowledge）、增量落盘与 leaf 持久化，均实测通过。
+1. **机制全部可用**：建档导入、规则分段建索引、LLM 逐段摘要、管理区注入（目录/精华/摘要）、四态记录、`recall` 工具注入与召回（query/directory/highlights/knowledge）、增量落盘与 leaf 持久化，均实测通过。
 2. **小对话不省 token，反而略增**：22.6K token 远低于 soft=100K / hard=103.4K，投影只加不减——管理区 +1 416 token（+6.4%），40 条原生消息**全部保留**。EC 的裁剪只在超硬线时才发生，四态推进在本例中一次都没触发（3 块始终停在 `summary`）。
 3. **catchup 冷缓存收益为 0**（两会话实测），会话路径约 99.3%。若要降低索引追赶成本，需要让块间 prompt 构成前缀扩展（例如把「滚动累计上下文/上一块摘要」放在 system 之后的稳定前缀位置，再拼接本块 range），而不是每块独立成 prompt。
 4. **疑似缺陷（本轮新发现）**：`unsummarized_tokens` 按「记录是否有 `ec` 字段」统计，而 catchup 只给每块**末条**记录盖 `ec` 戳，因此追赶完成后仍有 20 991 token、远超 target=10 000 → 每轮 prepare 只要投影 > soft 就会 `spawn_catchup`（子进程起来发现无新段后立即退出，幂等但空跑）。建议改为统计「最后一次带 `ec` 的记录之后的尾部」，或直接按未摘要块计。

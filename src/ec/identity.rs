@@ -44,7 +44,7 @@ pub fn leading_user_end(messages: &[ChatMessage]) -> usize {
 pub fn leading_user_anchor(messages: &[ChatMessage]) -> String {
     messages[..leading_user_end(messages)]
         .iter()
-        // 排除 EC 注入的投影消息（ec_management/ec_meta/ec_recall_result），
+        // 排除 EC 注入的投影消息（ec_management/ec_meta），
         // 否则下游把改写后的 request 回传时会污染锚定区、导致 session_id 漂移。
         .filter(|m| m.role == "user" && !is_projection_message(m))
         .map(|m| m.content.extract_text())
@@ -138,15 +138,22 @@ pub fn feature_text_of_record(r: &MessageRecord) -> String {
 
 /// 判断消息是否为"原生消息"（不是 EC 注入的投影消息）。
 ///
-/// EC 注入的投影消息带 name 字段标记（ec_meta / ec_management / ec_recall_result）。
+/// EC 注入的投影消息带 name 字段标记（ec_meta / ec_management）。
 pub fn is_projection_message(m: &ChatMessage) -> bool {
-    matches!(m.name.as_deref(), Some("ec_meta") | Some("ec_management") | Some("ec_recall_result"))
+    matches!(m.name.as_deref(), Some("ec_meta") | Some("ec_management"))
 }
 
 /// 判断消息是否为 recall 结果（增量估算与压缩时需跳过）。
+///
+/// 两种形态都认：
+/// - 旧形态：`name == "ec_recall_result"`（早期 function calling 残留，向后兼容）；
+/// - 新形态：正文含 `[EC_RECALL_RESULT]` 标记（模型通过 bash 调 `ec-hook recall` 的产出）。
 pub fn is_recall_result(m: &ChatMessage) -> bool {
-    m.name.as_deref() == Some("ec_recall_result")
+    m.name.as_deref() == Some("ec_recall_result") || m.content.extract_text().contains(EC_RECALL_MARKER)
 }
+
+/// recall 输出的包裹标记（与 `recall::format_hits` 一致）。
+pub const EC_RECALL_MARKER: &str = "[EC_RECALL_RESULT]";
 
 /// 从 ChatMessage 构造 MessageRecord（用于 append 到 JSONL）。
 pub fn to_record(m: &ChatMessage, parent_id: Option<&str>) -> MessageRecord {

@@ -1,4 +1,4 @@
-//! ec-recall CLI 的搜索逻辑（代理版）。
+//! recall CLI 的搜索逻辑（代理版）。
 //!
 //! ## 搜索范围：祖先链（叶子到根）
 //!
@@ -94,7 +94,7 @@ pub fn search(session_id: &str, query: &str, limit: usize, data_root: &str) -> V
 /// 召回完整标题目录（祖先链上所有压缩块的 block_id + title，不限状态）。
 ///
 /// 相对投影里被目录预算裁剪的目录区，这里返回**完整**目录，
-/// 供汰出后由 LLM 通过 `ec_recall directory` 找回。
+/// 供汰出后由 LLM 执行 `recall --directory` 找回。
 pub fn directory(session_id: &str, data_root: &str) -> Vec<RecallHit> {
     let store = Store::new(data_root);
     let leaf = match store.read_leaf(session_id) {
