@@ -27,6 +27,7 @@
 //! - `ping`：自检
 
 mod ec;
+mod help;
 mod hook;
 mod rpc;
 
@@ -43,6 +44,19 @@ fn main() {
 
     // 解析 --data 参数（ww3 call 模式会传插件数据目录）
     parse_data_arg(&args);
+
+    // --help / -h / help：打印完整手册（放在任何位置都生效）
+    if matches!(cmd, "--help" | "-h" | "help")
+        || args.iter().skip(1).any(|a| a == "--help" || a == "-h")
+    {
+        help::print_usage();
+        return;
+    }
+    // --version / -V
+    if matches!(cmd, "--version" | "-V") {
+        println!("ec-hook {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     match cmd {
         "call" | "stdio" => {
@@ -187,6 +201,7 @@ fn main() {
         }
         other => {
             eprintln!("未知命令: {other}");
+            eprintln!("运行 `ec-hook --help` 查看完整用法。");
             process::exit(2);
         }
     }

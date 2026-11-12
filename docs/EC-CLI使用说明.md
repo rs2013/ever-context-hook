@@ -1,6 +1,6 @@
-# EC 工具 CLI 使用说明（ever-context-hook）
+# EC 工具 CLI 使用说明（ec-hook）
 
-> 适用版本：`Cargo.toml` 0.1.0 / `manifest` 声明 0.2.0（产物：`target/release/ever-context-hook.exe`）
+> 适用版本：`Cargo.toml` 0.1.0 / `manifest` 声明 0.2.0（产物：`target/release/ec-hook.exe`）
 > 本文以源码为准（`src/main.rs`、`src/rpc.rs`、`src/hook.rs`、`src/ec/recall.rs`、`src/ec/catchup.rs`），非设计稿。
 
 ---
@@ -11,29 +11,29 @@
 
 | 身份 | 入口 | 谁调用 |
 | --- | --- | --- |
-| **ww3 Hook 插件**（主身份） | `ever-context-hook call --data <插件数据目录>`（`call` 可省略，默认就是它） | ww3-core 每请求 spawn 一次，走 stdin/stdout 的 JSONL RPC |
+| **ww3 Hook 插件**（主身份） | `ec-hook call --data <插件数据目录>`（`call` 可省略，默认就是它） | ww3-core 每请求 spawn 一次，走 stdin/stdout 的 JSONL RPC |
 | **辅助 CLI**（同一二进制） | `manifest` / `recall` / `catchup` / `ping` | 人工、LLM 通过 bash、或 hook 自己 detach 子进程 |
 
-**`--help` 报"未知命令"是预期行为**：本工具没有实现 `--help` / `-h` / `--version`，也没有 `clap` 之类的参数解析。任何未列出的第一个参数都会走：
+**`--help` / `-h` / `help` 打印完整命令行手册，`--version` / `-V` 打印版本**（均 exit 0）。未列出的子命令走：
 
 ```
 未知命令: <x>
+运行 `ec-hook --help` 查看完整用法。
 exit 2
 ```
 
-要看版本请用 `ever-context-hook manifest | jq -r .version`。
-
-### 契约符合度（精确表述）
+### 契约符合度（对标 `ref/wild-work3/protocol/meta/meta.go` + `protocol/plugin/plugin.go` + `core/internal/runtime/hook.go`）
 
 | 契约项 | 状态 |
 | --- | --- |
-| `manifest` 声明 `kind=hook`、`execution.control/conversation="call"`、`protocol 1..1` | ✅ 已实现 |
-| RPC 方法 `request.prepare`（一次性，返回改写后的 request） | ✅ 已实现 |
-| RPC 方法 `hook.stream`（双向流，透传事件 + 落盘响应） | ✅ 已实现 |
-| manifest 声明的 control 能力 `config.schema` / `config.get` / `ping` / `health.check` | ❌ **RPC 层未实现**（只有 `ping` 有本地子命令，RPC 调用会返回"未知方法"并 exit 1） |
-| `--help` / `--version` | ❌ 未实现 |
-
-也就是说：**hook 的两个核心方法齐了，control 面的四个方法只是 manifest 里写了、代码里没接**。如果 ww3 启动时会调 `config.get` 做健康检查，需要确认它的失败容忍策略。
+| `manifest` 字段齐全（`id/name/version/kind/protocol/execution/capabilities/icon/color/description`） | ✅ |
+| `execution.control/conversation="call"`（core 以 `["call","--data",dir]` 拉起） | ✅ 与 `route.go`/`hook.go` 的 `plugin.Spec` 一致 |
+| RPC 方法 `request.prepare`（`PrepareResult.Request` 整包替换） | ✅ 返回 `{"request": <完整请求>}` |
+| RPC 方法 `hook.stream`（双向流，`upstream.end` 收尾） | ✅ |
+| 生命周期 `initialize` / `capabilities.list` / `ping` / `health.check` / `shutdown` | ✅ 已实现，与 `capabilities` 声明一致 |
+| 未知方法返回 `error.kind=not_found`（core 靠它判定可选能力未实现） | ✅ 已实现，exit 0 |
+| `config.schema` / `config.get` | ⚠️ 未实现（与 loopguard 现状相同）；已从 `capabilities.control` 移除，调用返回 `not_found` |
+| `--help` / `-h` / `help` / `--version` / `-V` | ✅ 已实现 |
 
 ---
 
@@ -87,7 +87,7 @@ exit 2
 ## 2. `call`（默认）— ww3 Hook 入口
 
 ```
-ever-context-hook [call|stdio] [--data <插件数据目录>]
+ec-hook [call|stdio] [--data <插件数据目录>]
 ```
 
 `call` 与 `stdio` 完全等价。**不带任何子命令时默认就是 `call`**，所以 ww3 侧配置 `execution=call` + 参数 `["--data", "<dir>"]` 即可。
@@ -112,8 +112,14 @@ ever-context-hook [call|stdio] [--data <插件数据目录>]
 
 | method | 语义 | 返回 |
 | --- | --- | --- |
-| `request.prepare` | **一次性**：改写入站请求（落盘增量 + 注入管理区 + 硬预算降级 + 注入工具定义） | `result` 帧，`result = {"request": <改写后的完整请求>}` |
+| `request.prepare` | **一次性**：改写入站请求（落盘增量 + 注入管理区 + 硬预算降级 + 注入工具定义） | `result` 帧，`result = {"request": <改写后的完整请求>}`；失败 `error.kind=bad_params` |
 | `hook.stream` | **双向流**：透传上游事件，收集 assistant 回复并在 `upstream.end` 后落盘 | `result` 帧，`ok=true/false` |
+| `initialize` | 握手 | `{protocol:1, plugin_id, manifest, capabilities}` |
+| `capabilities.list` | 能力清单 | `{control:[...], conversation:[...]}` |
+| `ping` | 存活探针 | `"pong"` |
+| `health.check` | 健康检查 | `{"state":"ok"}` |
+| `shutdown` | 优雅退出 | `{"ok":true}` |
+| 其他 | 未实现的可选能力 | `error.kind=not_found`，exit 0（契约：core 据此判定可选能力未实现，非崩溃） |
 
 ### 2.2 `request.prepare` 示例
 
@@ -125,7 +131,7 @@ echo '{"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{
   "chain":{"index":0,"total":1},
   "config":{"enabled":true},
   "request":{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"你好"}]}
-}}' | ./ever-context-hook call --data ./e2e/data/core/plugins/ever-context
+}}' | ./ec-hook call --data ./e2e/data/core/plugins/ever-context
 ```
 
 预期 stdout（单行）：
@@ -134,7 +140,7 @@ echo '{"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{
 {"v":1,"id":"r1","op":"result","ok":true,"result":{"request":{"model":"deepseek-v4-pro","messages":[...],"tools":[...]}}}
 ```
 
-失败时（**注意**）：`errkind` 硬编码为 `prompt_too_long`、scope `request`、exit 1，即使真实原因是"缺 request 字段"。
+失败时（已修正）：错误码为 `bad_params`（prepare 唯一错误是入站请求缺字段），scope `request`，exit 1。硬预算超线在内部降级，不走错误通道。
 
 ### 2.3 `hook.stream` 示例
 
@@ -143,7 +149,7 @@ printf '%s\n%s\n%s\n' \
  '{"v":1,"id":"r2","op":"invoke","method":"hook.stream","params":{"request":{"model":"m","messages":[]},"config":{}}}' \
  '{"v":1,"id":"r2","op":"push","event":"text.delta","data":{"content":"回答"}}' \
  '{"v":1,"id":"r2","op":"push","event":"upstream.end","data":{"ok":true}}' \
- | ./ever-context-hook call
+ | ./ec-hook call
 ```
 
 识别并特殊处理的事件：
@@ -165,14 +171,14 @@ printf '%s\n%s\n%s\n' \
 ## 3. `manifest`
 
 ```
-ever-context-hook manifest [--out <path>]
+ec-hook manifest [--out <path>]
 ```
 
 - 无 `--out`：pretty JSON 打到 stdout。
 - 有 `--out`：写文件；写失败 exit 1。
 
 ```bash
-ever-context-hook manifest --out ./e2e/plugins/ever-context/0.1.0/manifest.json
+ec-hook manifest --out ./e2e/plugins/ever-context/0.1.0/manifest.json
 ```
 
 manifest 关键字段：`id=ever-context`、`kind=hook`、`version=0.2.0`、`execution.control/conversation=call`、`max_workers=8`、`capabilities.conversation=[hook.stream, request.prepare]`。
@@ -182,11 +188,11 @@ manifest 关键字段：`id=ever-context`、`kind=hook`、`version=0.2.0`、`exe
 ## 4. `recall` — 不调 LLM 的直接检索（LLM 通过 bash 调用）
 
 ```
-ever-context-hook recall --session <id> [--query <q>] [--limit <n>]
-ever-context-hook recall --directory  --session <id>
-ever-context-hook recall --highlights --session <id>
-ever-context-hook recall --knowledge --query <q> [--limit <n>]
-ever-context-hook recall --add-knowledge --title <t> --summary <s>
+ec-hook recall --session <id> [--query <q>] [--limit <n>]
+ec-hook recall --directory  --session <id>
+ec-hook recall --highlights --session <id>
+ec-hook recall --knowledge --query <q> [--limit <n>]
+ec-hook recall --add-knowledge --title <t> --summary <s>
 ```
 
 **模式优先级（从高到低，命中即返回）**：`--add-knowledge` → `--knowledge` → `--directory` → `--highlights` → 默认检索。
@@ -214,15 +220,15 @@ ever-context-hook recall --add-knowledge --title <t> --summary <s>
 
 ```bash
 # 本会话关键词召回（含原文回读）
-ever-context-hook recall --session 3f2a9c1b7d4e5061 --query "接口超时" --limit 3
+ec-hook recall --session 3f2a9c1b7d4e5061 --query "接口超时" --limit 3
 
 # 完整目录 / 完整精华
-ever-context-hook recall --session 3f2a9c1b7d4e5061 --directory
-ever-context-hook recall --session 3f2a9c1b7d4e5061 --highlights
+ec-hook recall --session 3f2a9c1b7d4e5061 --directory
+ec-hook recall --session 3f2a9c1b7d4e5061 --highlights
 
 # 跨会话知识
-ever-context-hook recall --knowledge --query "部署口令"
-ever-context-hook recall --add-knowledge --title "ww3 端口" --summary "core 默认监听 127.0.0.1:7864"
+ec-hook recall --knowledge --query "部署口令"
+ec-hook recall --add-knowledge --title "ww3 端口" --summary "core 默认监听 127.0.0.1:7864"
 ```
 
 > `--data` 也可用（全局参数），等价于提前设置 `EC_DATA_ROOT`。
@@ -232,7 +238,7 @@ ever-context-hook recall --add-knowledge --title "ww3 端口" --summary "core �
 ## 5. `catchup` — 旧对话离线追赶（后台逐段调 LLM 补摘要）
 
 ```
-ever-context-hook catchup --session <id> --core-data <core数据目录>
+ec-hook catchup --session <id> --core-data <core数据目录>
                           [--data <插件数据目录>] [--core <core可执行文件>] [--plugins <插件目录>]
                           [--model <模型>] [--thinking true|false]
                           [--target-tokens <n>] [--gap-ms <n>]
@@ -265,7 +271,7 @@ ever-context-hook catchup --session <id> --core-data <core数据目录>
 示例：
 
 ```bash
-ever-context-hook catchup \
+ec-hook catchup \
   --session 3f2a9c1b7d4e5061 \
   --data ./e2e/data/core/plugins/ever-context \
   --core ./e2e/ww3-core.exe \
@@ -282,7 +288,7 @@ ever-context-hook catchup \
 ## 6. `ping`
 
 ```
-ever-context-hook ping
+ec-hook ping
 ```
 
 向 **stderr** 打 `[ec-hook] ping: ok`，exit 0。仅自检用；RPC 层的 `ping` 方法未实现。
@@ -302,31 +308,31 @@ ever-context-hook ping
 | `degrade_target_ratio` | f64 | `0.6` | 硬线降级目标 = 软阈值 × 该比例（非 0.6 时重算整份预算） |
 | `target_tokens` | u32 | `10000` | 单块目标 token |
 | `compact.model` / `compact.thinking` | string/bool | 空 | **正常对话增量压缩**；模型缺省取本轮 `request.model`，thinking 缺省跟随请求 |
-| `catchup.model` / `catchup.thinking` | string/bool | 空 | 旧对话追赶（**尚未接线**，见下） |
-| `fail_open` | bool | `false` | 观测/门模式开关（**尚未接线**） |
+| `catchup.model` / `catchup.thinking` | string/bool | 空 | 旧对话追赶（**尚未接线**，见 §8） |
 
 > ⚠️ 旧配置里的 `growth_nudge`、`pressure_threshold` 已在死代码清理中移除（对应 `compress::decide` 链路），保留在 JSON 里不会报错但**不再生效**。`e2e/data/config.json` 里仍有这两个键，可一并删除。
-> ⚠️ `catchup.*` 与 `fail_open` 目前是「配置项存在但不生效」：自动 spawn 一律用 `compact` 模型；手工追赶用 CLI `--model`。这是已知待接线缺口。
+> ⚠️ `fail_open` 不属于插件配置：ww3 的 `hooks[].fail_open` 由 **core** 读取并决定启动/收尾失败时是否跳过本层，插件侧无权自决，故已从 `EcConfig` 删除。
 
 ---
 
 ## 8. 已知限制清单（按影响排序）
 
-1. `--help` / `-h` / `--version` 未实现，未知命令 exit 2。
-2. manifest 声明了 `config.schema` / `config.get` / `ping` / `health.check` 四个 control 能力，**RPC 层未实现**。
-3. `request.prepare` 的任何失败都被报成 `errkind=prompt_too_long`（硬编码）。
-4. `catchup.*` 插件配置、`fail_open` 尚未接线。
-5. `recall` 不调 LLM；RAG（`rag.model` + 生成式回答）只有设计，未实现，因此没有 `rag` 子命令。
-6. `catchup` 四态推进目前用 `WindowConfig::default()`，不随实际模型窗口变化。
-7. 并发写保护：`append`/`import_messages`/`update_leaf` 仍未纳入同一把会话写锁（评审 P0 项，未修）。
-8. `core_client` 无请求超时；锁 30 分钟过期且无心跳。
+1. `catchup.*` 插件配置尚未接线：自动 spawn 一律用 `compact` 模型，手工追赶用 CLI `--model`。
+2. `recall` 不调 LLM；RAG（`rag.model` + 生成式回答）只有设计，未实现，因此没有 `rag` 子命令。
+3. `catchup` 四态推进目前用 `WindowConfig::default()`，不随实际模型窗口变化。
+4. 并发写保护：`append`/`import_messages`/`update_leaf` 仍未纳入同一把会话写锁（评审 P0 项，未修）。
+5. `core_client` 无请求超时；锁 30 分钟过期且无心跳。
+6. `config.schema` / `config.get` 未实现（返回 `not_found`，与 loopguard 现状一致）。
 
 ---
 
 ## 9. 与你预期核对用的自检清单
 
-- [ ] 二进制路径 `target/release/ever-context-hook.exe`，ww3 侧只需 `["call","--data","<插件数据目录>"]`
+- [ ] 二进制名 `ec-hook`（`target/release/ec-hook.exe`），ww3 侧只需 `["call","--data","<插件数据目录>"]`
+- [ ] `--help` / `-h` / `help` 打印手册，`--version` / `-V` 打印版本
 - [ ] 两个 RPC 方法：`request.prepare`（结果在 `result.request`）、`hook.stream`（透传 + 落盘）
+- [ ] 五个生命周期方法：`initialize` / `capabilities.list` / `ping` / `health.check` / `shutdown`
+- [ ] 未知方法返回 `not_found` 而非崩溃
 - [ ] 五个子命令：`call`(默认) / `manifest` / `recall` / `catchup` / `ping`
 - [ ] `recall` 五模式与优先级：`--add-knowledge` > `--knowledge` > `--directory` > `--highlights` > 默认
 - [ ] `recall` 默认与 `--knowledge` 需要 `--query`；`--directory`/`--highlights`/默认 需要 `--session`

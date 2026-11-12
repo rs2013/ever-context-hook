@@ -18,9 +18,9 @@
 use crate::ec::{self, HookConfig};
 use crate::rpc::{self, Stream};
 
-/// manifest.json（ww3 插件注册用）。
-pub fn manifest_json() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
+/// manifest（ww3 插件注册用，PLUGIN_PROTOCOL §3）。
+pub fn manifest_value() -> serde_json::Value {
+    serde_json::json!({
         "id": "ever-context",
         "name": "Ever-Context 滚动上下文管理器",
         "version": "0.2.0",
@@ -31,14 +31,24 @@ pub fn manifest_json() -> String {
             "conversation": "call",
             "max_workers": 8
         },
-        "capabilities": {
-            "control": ["config.schema", "config.get", "ping", "health.check"],
-            "conversation": ["hook.stream", "request.prepare"]
-        },
+        "capabilities": capabilities_value(),
         "icon": "database",
         "color": "#722ed1",
         "description": "在固定上下文预算内实现超长任务的不间断执行。双上下文 JSONL 持久化 + 管理区投影 + 树状分叉召回。"
-    })).unwrap()
+    })
+}
+
+/// 能力清单：control 为标准生命周期五项，conversation 为本 hook 的两个方法。
+pub fn capabilities_value() -> serde_json::Value {
+    serde_json::json!({
+        "control": ["initialize", "capabilities.list", "ping", "health.check", "shutdown"],
+        "conversation": ["hook.stream", "request.prepare"]
+    })
+}
+
+/// manifest.json 文本（`ec-hook manifest` 子命令输出）。
+pub fn manifest_json() -> String {
+    serde_json::to_string_pretty(&manifest_value()).unwrap()
 }
 
 /// hook.stream 的主入口。

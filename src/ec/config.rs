@@ -52,11 +52,6 @@ pub struct EcConfig {
     /// 降级目标比例（首次尾部贴合降级时保留软阈值的比例，默认 0.6）。
     #[serde(default = "default_degrade_ratio")]
     pub degrade_target_ratio: f64,
-    /// fail_open：启动失败时是否跳过（观测模式为 true，门模式为 false）。
-    // TODO(未接线)：当前失败一律 pass-through 兜底，此开关待实现。
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub fail_open: bool,
     /// 单块目标 token（增量压缩/索引分段的块大小，默认 10_000）。
     #[serde(default = "default_target_tokens")]
     pub target_tokens: u32,
@@ -140,7 +135,6 @@ impl Default for EcConfig {
             hard_budget: 0,
             soft_threshold: 0,
             degrade_target_ratio: 0.6,
-            fail_open: false,
             target_tokens: 10_000,
             compact: SummaryLlmConfig::default(),
             catchup: SummaryLlmConfig::default(),

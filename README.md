@@ -26,11 +26,15 @@ stdin JSONL ──▶ [RPC layer] ──▶ [hook::handle_stream]
 
 | 命令 | 说明 |
 |---|---|
-| `call` | ww3 `hook.stream` 的一次调用（core 每请求 spawn 一次） |
-| `manifest` | 输出 `manifest.json` |
-| `recall` | ec-recall CLI，供 LLM 通过 skill 注入调用以搜索会话历史（不调用 LLM） |
+| `call`（默认） | ww3 hook 契约入口：`call --data <插件数据目录>`，core 每请求 spawn 一次，走 stdin JSONL RPC |
+| `manifest` | 输出 `manifest.json`（`--out <path>` 可写文件） |
+| `recall` | 检索 CLI，供人或 LLM 通过 bash 调用以搜索会话历史（不调用 LLM） |
 | `catchup` | 旧会话离线追赶压缩；可传 `--model`、`--thinking true|false` |
 | `ping` | 自检 |
+| `--help` / `-h` / `help` | 打印完整命令行手册 |
+| `--version` / `-V` | 打印版本 |
+
+产物为单二进制 `ec-hook`（`target/release/ec-hook.exe`）。完整 CLI 契约见 [`docs/EC-CLI使用说明.md`](docs/EC-CLI使用说明.md)；manifest 与 ww3 契约的逐项对照、承诺兑现缺口见 [`docs/EC-契约符合性与兑现缺口.md`](docs/EC-契约符合性与兑现缺口.md)。
 
 ## 目录
 

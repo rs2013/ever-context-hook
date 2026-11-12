@@ -5,7 +5,7 @@ edition = "2021"
 description = "Ever-Context (EC) 滚动上下文管理器 - ww3 拦截器插件（Rust 实现）"
 
 [[bin]]
-name = "ever-context-hook"
+name = "ec-hook"
 path = "src/main.rs"
 
 [dependencies]

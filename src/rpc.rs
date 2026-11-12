@@ -146,6 +146,25 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
 
 // ── 服务入口 ──
 
+/// 写一帧成功 result 并返回退出码。
+fn reply_ok(s: &mut Stream, id: &str, result: serde_json::Value) -> i32 {
+    let mut f = Frame::result(true);
+    f.id = id.to_string();
+    f.result = Some(result);
+    let _ = write_frame(&mut s.writer, &f);
+    let _ = s.writer.flush();
+    0
+}
+
+/// 写一帧错误 result 并返回调用方指定的退出码（契约错误码见 errkind）。
+fn reply_err(s: &mut Stream, id: &str, kind: &str, msg: &str, code: i32) -> i32 {
+    let mut f = Frame::result_error(kind, "request", msg);
+    f.id = id.to_string();
+    let _ = write_frame(&mut s.writer, &f);
+    let _ = s.writer.flush();
+    code
+}
+
 /// serve_once 处理一次 `call` 调用：读取 invoke → 执行业务 → 写 result → 退出。
 ///
 /// 返回退出码（0 成功，1 失败）。
@@ -199,29 +218,29 @@ pub fn serve_once(
     let exit_code = match invoke.method.as_str() {
         "hook.stream" => stream_handler(&mut stream),
         "request.prepare" => {
-            // 一次性方法：直接调用 prepare handler，写 result
+            // 一次性方法：直接调用 prepare handler。
+            // 失败归类为 bad_params（prepare 唯一错误是入站请求缺字段），不用 prompt_too_long：
+            // 硬预算超线在 prepare 内部已降级，不走错误通道。
             match prepare_handler(&req_id, &invoke.params) {
-                Ok(result_json) => {
-                    let mut frame = Frame::result(true);
-                    frame.id = req_id.clone();
-                    // result 帧的 result 字段携带改写后的 request
-                    frame.result = Some(result_json);
-                    let _ = write_frame(&mut stream.writer, &frame);
-                    let _ = stream.writer.flush();
-                    0
-                }
-                Err(msg) => {
-                    let mut frame = Frame::result_error("prompt_too_long", "request", &msg);
-                    frame.id = req_id.clone();
-                    let _ = write_frame(&mut stream.writer, &frame);
-                    let _ = stream.writer.flush();
-                    1
-                }
+                Ok(result_json) => reply_ok(&mut stream, &req_id, result_json),
+                Err(msg) => reply_err(&mut stream, &req_id, "bad_params", &msg, 1),
             }
         }
+        // ── 标准生命周期（PLUGIN_PROTOCOL §4，所有插件都应实现）──
+        "initialize" => reply_ok(&mut stream, &req_id, serde_json::json!({
+            "protocol": 1,
+            "plugin_id": "ever-context",
+            "manifest": crate::hook::manifest_value(),
+            "capabilities": crate::hook::capabilities_value(),
+        })),
+        "capabilities.list" => reply_ok(&mut stream, &req_id, crate::hook::capabilities_value()),
+        "ping" => reply_ok(&mut stream, &req_id, serde_json::json!("pong")),
+        "health.check" => reply_ok(&mut stream, &req_id, serde_json::json!({ "state": "ok" })),
+        "shutdown" => reply_ok(&mut stream, &req_id, serde_json::json!({ "ok": true })),
         other => {
-            eprintln!("[ec-hook] 未知方法: {other}");
-            return 1;
+            // 契约：未知方法返回 not_found，core 靠它判断「可选能力未实现」。
+            // 已正常应答，退出码 0（进程崩溃才是 1）。
+            reply_err(&mut stream, &req_id, "not_found", &format!("unknown method {other}"), 0)
         }
     };
 
