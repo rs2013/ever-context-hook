@@ -26,7 +26,6 @@ use crate::ec::store::Store;
 use crate::ec::types::{BlockState, EcProjection, MessageRecord};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// 追赶进程配置。
@@ -279,6 +278,7 @@ fn update_index(
         doc_type: "ec_block".to_string(),
         title: summary.title.clone(),
         summary: summary.summary.clone(),
+        raw_body: crate::ec::index::records_raw_text(chain[start..=end].iter()),
         doc_text: String::new(), // ec_block 无 STORED 正文（原文权威在 JSONL）
         path: store.session_file_path(&config.session_id).display().to_string(),
         start_line: line_of(&chain[start].id),

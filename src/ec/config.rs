@@ -22,8 +22,6 @@ pub struct HookConfig {
     pub model: String,
     /// 当前对话请求的思考开关（只有明确传入时才存在）。
     pub request_thinking: Option<bool>,
-    /// 请求声明的 max_tokens（用于计算可用预算）。
-    pub max_tokens: Option<u32>,
     /// 会话 ID（首条 user 锚定区 SHA）。
     pub session_id: String,
     /// 请求消息（入站原文，含 system/tool 等所有角色）。
@@ -32,8 +30,6 @@ pub struct HookConfig {
     pub window: WindowConfig,
     /// 本 hook 专属配置。
     pub ec: EcConfig,
-    /// upstream 摘要。
-    pub upstream_ok: bool,
     /// 数据根目录（JSONL 存储）。
     pub data_root: String,
 }
@@ -44,22 +40,21 @@ pub struct EcConfig {
     /// 是否启用（false 时纯透传）。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 上下文窗口覆盖（0 = 按模型名推断 infer_context_window，1 以上为显式 token 数）。
+    #[serde(default)]
+    pub context_window: u32,
     /// 硬预算门覆盖（0 = 自动从模型上下文窗口推算）。
     #[serde(default)]
     pub hard_budget: u32,
     /// 软阈值覆盖（0 = 用 deriveBudget 公式）。
     #[serde(default)]
     pub soft_threshold: u32,
-    /// growth nudge 步长（token），每次压缩后预算增量。
-    #[serde(default = "default_growth_nudge")]
-    pub growth_nudge: u32,
-    /// 压力阈值（0-1），token 占比超过此值触发压缩。
-    #[serde(default = "default_pressure")]
-    pub pressure_threshold: f64,
     /// 降级目标比例（首次尾部贴合降级时保留软阈值的比例，默认 0.6）。
     #[serde(default = "default_degrade_ratio")]
     pub degrade_target_ratio: f64,
     /// fail_open：启动失败时是否跳过（观测模式为 true，门模式为 false）。
+    // TODO(未接线)：当前失败一律 pass-through 兜底，此开关待实现。
+    #[allow(dead_code)]
     #[serde(default)]
     pub fail_open: bool,
     /// 单块目标 token（增量压缩/索引分段的块大小，默认 10_000）。
@@ -69,6 +64,8 @@ pub struct EcConfig {
     #[serde(default)]
     pub compact: SummaryLlmConfig,
     /// 旧对话追赶；未指定模型时使用会话最后一条 assistant 的模型。
+    // TODO(未接线)：prepare 触发的 spawn 目前一律用 compact 模型，手工追赶走 CLI --model。
+    #[allow(dead_code)]
     #[serde(default)]
     pub catchup: SummaryLlmConfig,
 }
@@ -96,12 +93,25 @@ mod tests {
     }
 
     #[test]
+    fn context_window_override_beats_model_inference() {
+        let explicit = HookConfig::from_params(&serde_json::json!({
+            "request": {"model": "some-custom-model", "messages": [{"role":"user","content":"hi"}]},
+            "config": {"context_window": 32_000}
+        }));
+        assert_eq!(explicit.window.context_window, 32_000);
+        // 未配置时可被模型名覆盖；custom 模型落到保守默认 128K
+        let inferred = HookConfig::from_params(&serde_json::json!({
+            "request": {"model": "some-custom-model"}
+        }));
+        assert_eq!(inferred.window.context_window, 128_000);
+    }
+
+    #[test]
     fn max_tokens_overrides_output_reserve() {
         let params = serde_json::json!({
             "request": {"model": "gpt-4", "max_tokens": 2048, "messages": [{"role":"user","content":"hi"}]}
         });
         let cfg = HookConfig::from_params(&params);
-        assert_eq!(cfg.max_tokens, Some(2048));
         assert_eq!(cfg.window.max_output_tokens, 2048);
         assert_eq!(
             cfg.window.hard_budget,
@@ -119,8 +129,6 @@ pub struct SummaryLlmConfig {
 }
 
 fn default_true() -> bool { true }
-fn default_growth_nudge() -> u32 { 50_000 }
-fn default_pressure() -> f64 { 0.75 }
 fn default_degrade_ratio() -> f64 { 0.6 }
 fn default_target_tokens() -> u32 { 10_000 }
 
@@ -128,10 +136,9 @@ impl Default for EcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            context_window: 0,
             hard_budget: 0,
             soft_threshold: 0,
-            growth_nudge: 50_000,
-            pressure_threshold: 0.75,
             degrade_target_ratio: 0.6,
             fail_open: false,
             target_tokens: 10_000,
@@ -182,9 +189,17 @@ impl HookConfig {
             .and_then(|c| serde_json::from_value(c.clone()).ok())
             .unwrap_or_default();
 
-        // 上下文窗口：从模型名推断，硬预算/软阈值可用配置覆盖
-        let context_window = infer_context_window(&model);
+        // 上下文窗口：显式配置 > 模型名推断，硬预算/软阈值可用配置覆盖
+        let context_window = if ec.context_window > 0 {
+            ec.context_window
+        } else {
+            infer_context_window(&model)
+        };
         let mut window = WindowConfig::for_window(context_window);
+        // 降级比例可配置（默认 0.6）：非默认值时按新比例重算派生预算。
+        if (ec.degrade_target_ratio - 0.6).abs() > f64::EPSILON {
+            window.budget = crate::ec::types::DerivedBudget::derive_with_ratio(context_window, ec.degrade_target_ratio);
+        }
         // 请求声明的 max_tokens 优先作为输出预留，替换 for_window 的固定 8192。
         if let Some(mt) = max_tokens {
             window.max_output_tokens = mt;
@@ -203,11 +218,6 @@ impl HookConfig {
             window.budget.target_tokens = ec.target_tokens;
         }
 
-        let upstream_ok = params.get("upstream")
-            .and_then(|u| u.get("ok"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-
         // 数据根：环境变量 EC_DATA_ROOT > ww3 的 --data 参数（由 main 传入）
         // 这里先用环境变量，main 里解析 --data 后覆盖。
         let data_root = std::env::var("EC_DATA_ROOT")
@@ -219,12 +229,10 @@ impl HookConfig {
             chain_total,
             model,
             request_thinking,
-            max_tokens,
             session_id,
             messages,
             window,
             ec,
-            upstream_ok,
             data_root,
         }
     }

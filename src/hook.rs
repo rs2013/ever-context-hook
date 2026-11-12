@@ -252,7 +252,7 @@ pub fn handle_stream(s: &mut Stream) -> i32 {
 /// 2. 构建管理区（压缩块摘要）
 /// 3. 硬预算门检查（超线 → 拒绝，返回 prompt_too_long）
 /// 4. 改写 messages：前置 system + 管理区 + 尾部原生
-pub fn handle_prepare(req_id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub fn handle_prepare(_req_id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     let cfg = HookConfig::from_params(params);
     log::info!("[ec-prepare] hook_id={} chain={}/{} model={} session={}",
         cfg.hook_id, cfg.chain_index, cfg.chain_total, cfg.model, cfg.session_id);

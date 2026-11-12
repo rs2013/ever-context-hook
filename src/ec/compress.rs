@@ -1,9 +1,9 @@
 //! 压缩触发与执行（代理版）。
 //!
-//! ## 触发条件（对齐设计文档 §6）
+//! ## 触发条件
 //!
-//! 1. **Growth Nudge**：自上次压缩以来累计增量 ≥ growth_nudge。
-//! 2. **Pressure**：投影 token 占比 ≥ pressure_threshold。
+//! 触发判定已前移到 prepare 阶段（那里有完整 messages 与真实预算，见 hook.rs），
+//! 本模块只保留统一摘要算法与提示词。
 //!
 //! ## 关键规则
 //!
@@ -22,52 +22,7 @@
 //! （不靠 tool_result / user prompt 触发）；正常对话增量压缩由请求触发。
 
 use crate::ec::core_client::{ChatResult, CoreClient};
-use crate::ec::identity::is_recall_result;
-use crate::ec::types::{BlockState, ChatMessage, MessageRecord};
-
-/// 压缩决策。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompressDecision {
-    /// 不压缩。
-    None,
-    /// 软阈值触发（growth nudge 或 pressure）。
-    SoftTrigger { reason: CompressReason },
-    /// 硬预算超线（必须压缩才能继续）。
-    HardTrigger,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressReason {
-    GrowthNudge,
-    Pressure,
-}
-
-/// 评估是否需要压缩。
-///
-/// - `current_tokens`：当前投影 token（**已跳过 recall 内容**）。
-/// - `last_compaction_tokens`：上次压缩时的累计 token。
-/// - `window`：上下文窗口配置。
-/// - `growth_nudge`：growth nudge 阈值。
-/// - `pressure_threshold`：压力阈值（0-1）。
-pub fn decide(
-    current_tokens: u64,
-    last_compaction_tokens: u64,
-    hard_budget: u32,
-    soft_threshold: u32,
-    growth_nudge: u32,
-    pressure_threshold: f64,
-) -> CompressDecision {
-    if current_tokens > hard_budget as u64 {
-        return CompressDecision::HardTrigger;
-    }
-    if crate::ec::budget::should_growth_nudge(current_tokens, last_compaction_tokens, growth_nudge) {
-        return CompressDecision::SoftTrigger { reason: CompressReason::GrowthNudge };
-    }
-    if (current_tokens as f64) >= (soft_threshold as f64) * pressure_threshold {
-        return CompressDecision::SoftTrigger { reason: CompressReason::Pressure };
-    }
-    CompressDecision::None
-}
+use crate::ec::types::MessageRecord;
 
 /// 压缩提示词（给 LLM 的 system prompt 片段）。
 ///
@@ -86,26 +41,6 @@ pub const COMPRESS_SYSTEM_PROMPT: &str = r#"你是一个滚动上下文维护器
 
 输出格式：
 {"title": "...", "summary": "...", "highlights": ["..."]}"#;
-
-/// 判断一段消息序列中哪些是"可压缩的原文"（排除 recall 结果与投影消息）。
-pub fn compressible_messages(messages: &[ChatMessage]) -> Vec<&ChatMessage> {
-    messages.iter()
-        .filter(|m| !is_recall_result(m) && !crate::ec::identity::is_projection_message(m))
-        .collect()
-}
-
-/// 判断祖先链中哪些记录是"可压缩的原文"（排除 ec 投影产物与 recall 结果）。
-pub fn compressible_records(chain: &[MessageRecord]) -> Vec<&MessageRecord> {
-    chain.iter()
-        .filter(|r| r.ec.is_none())
-        .filter(|r| r.name.as_deref() != Some("ec_recall_result"))
-        .collect()
-}
-
-/// 判断某条记录是否处于"未压缩"状态（无 ec 字段，或 ec.state == raw）。
-pub fn is_uncompressed(r: &MessageRecord) -> bool {
-    r.ec.as_ref().map(|ec| ec.state == BlockState::Raw).unwrap_or(true)
-}
 
 // ────────────────────────────────────────────────────────────────────────────
 // 统一压缩算法（唯一一份）：追赶 / 正常对话增量压缩 / 维护共用
@@ -243,13 +178,35 @@ pub fn run_summary_call(
     Ok((res, parsed))
 }
 
-/// 解析 LLM 摘要响应（容忍 markdown 围栏）。
+/// 解析 LLM 摘要响应（容忍 markdown 围栏），并做字段质量约束。
+///
+/// 约束（防异常输出膨胀管理区）：
+/// - title 非空且 ≤ 80 字、summary 非空且 ≤ 2000 字、highlights ≤ 5 条且每条 ≤ 80 字；
+/// - 违反任一约束视为解析失败（返回 None），由调用方重试或跳过该块。
 pub fn parse_summary(text: &str) -> Option<Summary> {
-    if let Ok(s) = serde_json::from_str::<Summary>(text.trim()) { return Some(s); }
-    if let Some(inner) = extract_fenced_json(text) {
-        if let Ok(s) = serde_json::from_str::<Summary>(inner) { return Some(s); }
+    let mut raw = serde_json::from_str::<Summary>(text.trim()).ok();
+    if raw.is_none() {
+        if let Some(inner) = extract_fenced_json(text) {
+            raw = serde_json::from_str::<Summary>(inner).ok();
+        }
     }
-    None
+    let raw = raw?;
+    // 空 title/summary 是明显质量问题，拒绝
+    if raw.title.trim().is_empty() || raw.summary.trim().is_empty() {
+        return None;
+    }
+    // 长度约束（按字符数，CJK 友好）
+    if raw.title.chars().count() > 80
+        || raw.summary.chars().count() > 2000
+        || raw.highlights.len() > 5
+        || raw.highlights.iter().any(|h| h.chars().count() > 80) {
+        return None;
+    }
+    Some(Summary {
+        title: raw.title.trim().to_string(),
+        summary: raw.summary.trim().to_string(),
+        highlights: raw.highlights,
+    })
 }
 
 fn extract_fenced_json(text: &str) -> Option<&str> {
@@ -264,40 +221,6 @@ fn extract_fenced_json(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decide_none_when_under_thresholds() {
-        assert_eq!(
-            decide(10_000, 0, 160_000, 100_000, 50_000, 0.75),
-            CompressDecision::None
-        );
-    }
-
-    #[test]
-    fn decide_growth_nudge() {
-        assert_eq!(
-            decide(60_000, 0, 160_000, 100_000, 50_000, 0.75),
-            CompressDecision::SoftTrigger { reason: CompressReason::GrowthNudge }
-        );
-    }
-
-    #[test]
-    fn decide_pressure() {
-        // 90K > 100K * 0.75 = 75K，但 < growth_nudge(50K 增量)
-        // 用 last_compaction_tokens = 80K，增量 10K < 50K，但压力触发
-        assert_eq!(
-            decide(90_000, 80_000, 160_000, 100_000, 50_000, 0.75),
-            CompressDecision::SoftTrigger { reason: CompressReason::Pressure }
-        );
-    }
-
-    #[test]
-    fn decide_hard() {
-        assert_eq!(
-            decide(170_000, 0, 160_000, 100_000, 50_000, 0.75),
-            CompressDecision::HardTrigger
-        );
-    }
 
     fn rec(id: &str, role: &str, content: &str) -> MessageRecord {
         serde_json::from_value(serde_json::json!({
@@ -344,5 +267,24 @@ mod tests {
         let q = unique_quote_in(&once, boundary).unwrap();
         assert_eq!(once.matches(&q).count(), 1);
         assert_eq!(q.len(), 48); // 最短唯一前缀 = MIN 长度
+    }
+
+    // parse_summary 质量约束：空字段 / 超长被拒绝，正常与 markdown 围栏可解析
+    #[test]
+    fn parse_summary_enforces_field_quality() {
+        assert!(parse_summary("not json").is_none());
+        assert!(parse_summary(r#"{\"title\":\"\",\"summary\":\"x\"}"#).is_none()); // 空 title
+        assert!(parse_summary(r#"{\"title\":\"t\",\"summary\":\"\"}"#).is_none()); // 空 summary
+        // 超长 title 拒绝
+        let long_title = "字".repeat(81);
+        assert!(parse_summary(&format!(r#"{{\"title\":\"{long_title}\",\"summary\":\"s\"}}"#)).is_none());
+        // highlights 超条数拒绝
+        let too_many = vec!["h"; 6].join("\",\"");
+        assert!(parse_summary(&format!(r#"{{\"title\":\"t\",\"summary\":\"s\",\"highlights\":[\"{too_many}\"]}}"#)).is_none());
+        // 围栏 + 合法内容可解析
+        let fenced = "```json\n{\"title\":\"标题\",\"summary\":\"摘要内容\",\"highlights\":[\"a\",\"b\"]}\n```";
+        let s = parse_summary(fenced).unwrap();
+        assert_eq!(s.title, "标题");
+        assert_eq!(s.highlights.len(), 2);
     }
 }

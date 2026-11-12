@@ -107,6 +107,32 @@ impl Store {
         Ok(out)
     }
 
+    /// 按路径与行区间读原始 JSONL 行（verbatim，供召回原文）。
+    /// 行号 1-based 闭区间 [start, end]；文件不存在或区间空返回 Ok(vec![])。
+    pub fn read_lines_range(&self, path: &str, start: u64, end: u64) -> Result<Vec<String>, StoreError> {
+        if start == 0 || end == 0 || start > end {
+            return Ok(Vec::new());
+        }
+        let f = fs::File::open(path)?;
+        let reader = BufReader::new(f);
+        let mut out = Vec::new();
+        let mut n: u64 = 0;
+        for line in reader.lines() {
+            let line = line?;
+            n += 1;
+            if n < start {
+                continue;
+            }
+            if n > end {
+                break;
+            }
+            if !line.trim().is_empty() {
+                out.push(line);
+            }
+        }
+        Ok(out)
+    }
+
     /// 更新某条记录的 ec 字段（写入压缩产物）。
     ///
     /// 内部持 JSONL 写锁（与 append/import 互斥）。全量重写 JSONL。
@@ -429,7 +455,7 @@ mod tests {
         let records = vec![
             rec("root", None, "user", "hello"),
             rec("a1", Some("root"), "assistant", "hi"),
-            rec("u2", Some("a1"), "user", "继续"),
+            rec("u2", Some("a1"), "user", "继续"),  // 与 u2 内容重复！
             rec("a3", Some("u2"), "assistant", "hi"),  // 与 a1 内容重复！
             rec("u4", Some("a3"), "user", "继续"),      // 与 u2 内容重复！
         ];
@@ -444,6 +470,31 @@ mod tests {
         ];
         let located = store.locate("s1", &tail).unwrap();
         assert_eq!(located, Some("u4".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_lines_range_returns_verbatim_rows() {
+        let (store, dir) = tmp_store();
+        let records = vec![
+            rec("root", None, "user", "第一行"),
+            rec("a1", Some("root"), "assistant", "第二行"),
+            rec("u2", Some("a1"), "user", "第三行"),
+        ];
+        store.append("s1", &records).unwrap();
+        let path = store.session_file_path("s1");
+
+        // [1,2] 闭区间：取 root 与 a1 两行
+        let lines = store.read_lines_range(&path.display().to_string(), 1, 2).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("第一行"));
+        assert!(lines[1].contains("第二行"));
+
+        // 区间外/空区间返回空
+        assert!(store.read_lines_range(&path.display().to_string(), 0, 5).unwrap().is_empty());
+        assert!(store.read_lines_range(&path.display().to_string(), 4, 9).unwrap().is_empty());
+        // 文件不存在返回空
+        assert!(store.read_lines_range("nonexistent.jsonl", 1, 2).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

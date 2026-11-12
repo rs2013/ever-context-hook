@@ -4,7 +4,6 @@
 //!
 //! 1. **硬预算门**（请求前）：projected_tokens > hard_budget → 拒绝/降级。
 //! 2. **软阈值**（请求后）：projected_tokens > soft_threshold → 触发压缩。
-//! 3. **Growth Nudge**：自上次压缩以来累计增量 ≥ growth_nudge → 触发压缩。
 //!
 //! ## 关键规则：召回内容不计入增量
 //!
@@ -12,39 +11,7 @@
 //! 否则全文召回一次 +10K token 会立刻触发又一次压缩（无新内容，浪费 + 死循环）。
 
 use crate::ec::identity::is_recall_result;
-use crate::ec::types::{ChatMessage, WindowConfig};
-
-/// 预算检查结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BudgetCheck {
-    /// 预算充足，无需处理。
-    Ok,
-    /// 软阈值触发：建议在下次请求前执行压缩维护。
-    SoftTrigger { prompt_tokens: u32, threshold: u32 },
-    /// 硬预算超线：当前请求不可放行。
-    HardOverBudget { prompt_tokens: u32, hard_budget: u32 },
-}
-
-/// 执行预算检查。
-pub fn check(prompt_tokens: u32, window: &WindowConfig) -> BudgetCheck {
-    let effective_hard = window.hard_budget;
-
-    if prompt_tokens > effective_hard {
-        return BudgetCheck::HardOverBudget {
-            prompt_tokens,
-            hard_budget: effective_hard,
-        };
-    }
-
-    if prompt_tokens > window.budget.soft_threshold {
-        return BudgetCheck::SoftTrigger {
-            prompt_tokens,
-            threshold: window.budget.soft_threshold,
-        };
-    }
-
-    BudgetCheck::Ok
-}
+use crate::ec::types::ChatMessage;
 
 /// 估算 prompt 的 token 数（粗估：字符数 ÷ 3）。
 ///
@@ -84,15 +51,6 @@ pub fn anchor_and_tail_start(messages: &[ChatMessage], sys_end: usize, budget_to
     let tail_room = budget_tokens.saturating_sub(anchor_tokens);
     let tail_start = tail_fit_start(&messages[anchor_end..], tail_room) + anchor_end;
     (anchor_end, tail_start)
-}
-
-/// growth nudge 检查：自上次压缩以来累计增量是否 ≥ growth_nudge。
-pub fn should_growth_nudge(
-    current_tokens: u64,
-    last_compaction_tokens: u64,
-    growth_nudge: u32,
-) -> bool {
-    current_tokens.saturating_sub(last_compaction_tokens) >= growth_nudge as u64
 }
 
 /// 单条消息的 token 估算（含 4 token 固定开销）。
@@ -208,15 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn test_budget_check() {
-        // 用 400K 窗口：soft = clamp(200K, 100K, 500K) = 200K，硬线 = 400K - 40K - 8K
-        let w = WindowConfig::for_window(400_000);
-        assert_eq!(check(50_000, &w), BudgetCheck::Ok);
-        assert!(matches!(check(210_000, &w), BudgetCheck::SoftTrigger { .. }));
-        assert!(matches!(check(400_000, &w), BudgetCheck::HardOverBudget { .. }));
-    }
-
-    #[test]
     fn test_estimate_skips_recall() {
         let msgs = vec![
             msg("user", "帮我写函数"),
@@ -225,12 +174,6 @@ mod tests {
         let tokens = estimate_prompt_tokens(&msgs);
         // recall 消息被跳过，只剩 user 消息（4 + content/3）
         assert_eq!(tokens, 4 + msg("user", "帮我写函数").content.estimated_tokens());
-    }
-
-    #[test]
-    fn test_growth_nudge() {
-        assert!(should_growth_nudge(100_000, 40_000, 50_000));
-        assert!(!should_growth_nudge(70_000, 40_000, 50_000));
     }
 
     #[test]

@@ -18,26 +18,30 @@
 //! 每次 open → 读写 → commit → 退出（一请求一进程，开销已验证可接受）。
 
 use std::path::Path;
+use std::sync::OnceLock;
 
+use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
-    IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value, STORED,
-    STRING,
+    IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions,
+    Value, STORED, STRING,
 };
 use tantivy::tokenizer::{
     LowerCaser, PreTokenizedStream, PreTokenizedString, TextAnalyzer, Token, Tokenizer,
 };
 use tantivy::{Index, Term};
 
-pub use tantivy::Index as TantivyIndex;
-
 /// 代理版 schema 版本（与 Pi 版 ec-index 的 v4 完全分开，独立演进）。
 /// v2：title/summary 改为只索引不 STORED（消除 ec_block 的 JSONL↔索引双存冗余），
 ///     新增 doc_text 字段（knowledge 正文 STORED）。
-pub const SCHEMA_VERSION: u32 = 2;
-/// CJK 分词器名（与 ec-index 的 ec_cjk_unigram_v1 同实现）。
-pub const CJK_TOKENIZER: &str = "ec_cjk_unigram_v1";
+/// v3：新增 raw_body 字段（ec_block 原文合流，只索引不 STORED）——在 catchup 完成前
+///     段也可被全文检索，命中后由调用方按 path/start_line/end_line 回读 JSONL 原文。
+/// v4：分词器从自研 unigram（ec_cjk_unigram_v1）替换为 jieba-rs 语义分词
+///     （如 `上下文管理` 切成整词而非单字，大幅提升检索精确率）；索引需重建。
+pub const SCHEMA_VERSION: u32 = 4;
+/// CJK 分词器名（jieba-rs 语义分词，取代自研 unigram）。
+pub const CJK_TOKENIZER: &str = "ec_jieba_v1";
 
 /// 构建代理版 schema：摘要层（标题+摘要+定位）+ 会话/分支维度。
 pub fn build_schema() -> Schema {
@@ -58,7 +62,9 @@ pub fn build_schema() -> Schema {
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         );
     builder.add_text_field("title", searchable.clone());
-    builder.add_text_field("summary", searchable);
+    builder.add_text_field("summary", searchable.clone());
+    // 原文合流（CJK 分词，只索引不 STORED）：catchup 前段即可被检索，命中后回读 JSONL。
+    builder.add_text_field("raw_body", searchable);
 
     // knowledge 正文 STORED（knowledge 无 JSONL 权威，召回需读回原文）。
     builder.add_text_field("doc_text", exact.clone());
@@ -72,6 +78,7 @@ pub fn build_schema() -> Schema {
 /// 打开（不存在则创建）索引目录，校验 schema 并注册分词器。
 /// schema 不符时清空重建（索引是派生缓存，可从 JSONL 重扫）。
 pub fn open_index(dir: &Path) -> Result<Index, Box<dyn std::error::Error>> {
+    log::debug!("[ec-index] open dir={} schema=v{SCHEMA_VERSION}", dir.display());
     let meta = dir.join("meta.json");
     let index = if meta.exists() {
         match Index::open_in_dir(dir) {
@@ -97,13 +104,15 @@ pub fn open_index(dir: &Path) -> Result<Index, Box<dyn std::error::Error>> {
     Ok(index)
 }
 
-/// 注册 CJK 分词器（写入与查询两侧一致）。
+/// 注册中文语义分词器（写入与查询两侧一致）。基于 jieba-rs，进程内单例字典。
 pub fn register_tokenizer(index: &Index) {
     index.tokenizers().register(
         CJK_TOKENIZER,
-        TextAnalyzer::builder(CjkUnigramTokenizer)
-            .filter(LowerCaser)
-            .build(),
+        TextAnalyzer::builder(JiebaTokenizer {
+            jieba: jieba(),
+        })
+        .filter(LowerCaser)
+        .build(),
     );
 }
 
@@ -119,6 +128,7 @@ pub struct EcBlockDoc {
     pub doc_type: String, // "ec_block" | "knowledge"
     pub title: String,    // 只索引不 STORED（检索用，原文权威在 JSONL）
     pub summary: String,  // 只索引不 STORED（同上）
+    pub raw_body: String, // 只索引不 STORED（段内原文合流，检索用；权威原文在 JSONL）
     pub doc_text: String, // knowledge 正文 STORED（title\nsummary）；ec_block 留空
     pub path: String,     // JSONL 文件路径
     pub start_line: u64,
@@ -151,6 +161,7 @@ fn build_document(schema: &Schema, doc: &EcBlockDoc) -> tantivy::Result<TantivyD
     d.add_text(f("doc_type"), &doc.doc_type);
     d.add_text(f("title"), &doc.title);
     d.add_text(f("summary"), &doc.summary);
+    d.add_text(f("raw_body"), &doc.raw_body);
     d.add_text(f("doc_text"), &doc.doc_text);
     d.add_text(f("path"), &doc.path);
     d.add_u64(f("start_line"), doc.start_line);
@@ -187,6 +198,7 @@ pub fn index_knowledge(
         doc_type: "knowledge".to_string(),
         title: title.to_string(),
         summary: summary.to_string(),
+        raw_body: String::new(), // knowledge 无原文合流
         doc_text: format!("{title}\n{summary}"), // STORED 供召回读回
         path: String::new(),
         start_line: 0,
@@ -223,6 +235,7 @@ pub fn search(
     let searcher = reader.searcher();
     let title = schema.get_field("title")?;
     let summary = schema.get_field("summary")?;
+    let raw_body = schema.get_field("raw_body")?;
     let session_field = schema.get_field("session_id")?;
     let type_field = schema.get_field("doc_type")?;
 
@@ -230,7 +243,7 @@ pub fn search(
     let text_query: Box<dyn Query> = if query.trim().is_empty() {
         Box::new(tantivy::query::AllQuery)
     } else {
-        let parser = QueryParser::for_index(index, vec![title, summary]);
+        let parser = QueryParser::for_index(index, vec![title, summary, raw_body]);
         Box::new(parser.parse_query(query)?)
     };
 
@@ -304,11 +317,39 @@ fn make_block(
         doc_type: "ec_block".to_string(),
         title: String::new(),   // 追赶前空
         summary: String::new(), // 追赶前空
+        raw_body: records_raw_text(rows[start..=end].iter().map(|(_, r)| r)),
         doc_text: String::new(), // ec_block 无 STORED 正文（原文权威在 JSONL）
         path: path.to_string(),
         start_line: rows[start].0,
         end_line: rows[end].0,
     }
+}
+
+/// 渲染段内记录的可检索原文合流（role: content + assistant 工具调用）。
+/// 多模态图片等无正文部分忽略（与 extract 口径一致），空消息跳过。
+pub(crate) fn records_raw_text<'a>(
+    rows: impl Iterator<Item = &'a crate::ec::types::MessageRecord>,
+) -> String {
+    rows.map(record_raw_text)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 渲染单条记录的可检索原文（role: content + [tool name(args)]）。
+/// 供 index_session 与 catchup 建块共用（DRY）。
+pub(crate) fn record_raw_text(r: &crate::ec::types::MessageRecord) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !r.content.is_empty() {
+        parts.push(r.content.clone());
+    }
+    for tc in &r.tool_calls {
+        parts.push(format!("[tool {}({})]", tc.function.name, tc.function.arguments));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{}: {}", r.role, parts.join(" "))
 }
 
 fn extract_hit(schema: &Schema, doc: &TantivyDocument, score: f32) -> SearchHit {
@@ -338,56 +379,50 @@ fn extract_hit(schema: &Schema, doc: &TantivyDocument, score: f32) -> SearchHit 
         title: String::new(),
         summary: String::new(),
         doc_text: get("doc_text"),
-        path: get("path"),
-        start_line: get_u64("start_line"),
+        path: get("path"),        start_line: get_u64("start_line"),
         end_line: get_u64("end_line"),
         score,
     }
 }
 
-// ── CJK 分词器（与 ec-index 的 ec_cjk_unigram_v1 同实现） ──
+// ── 中文语义分词器（jieba-rs，替代自研 unigram） ──
 
-/// 汉字逐字切词，非汉字的连续字母/数字保留为词；不是语义中文分词。
+/// Jieba 单例：字典较大（默认约 5MB 内嵌），只初始化一次进程共享。
+fn jieba() -> &'static Jieba {
+    static JIEBA: OnceLock<Jieba> = OnceLock::new();
+    JIEBA.get_or_init(Jieba::new)
+}
+
+/// 基于 jieba-rs 的 Tantivy 分词器：把 jieba 切出的词语映射为 Token。
+/// 采用默认切分（非 Search 模式），每个词位置连续（position_length=1），
+/// 使 PhraseQuery（连续短语）也能正确匹配；过滤纯标点/空白/空词。
 #[derive(Clone)]
-struct CjkUnigramTokenizer;
+struct JiebaTokenizer {
+    jieba: &'static Jieba,
+}
 
-impl Tokenizer for CjkUnigramTokenizer {
+impl Tokenizer for JiebaTokenizer {
     type TokenStream<'a> = PreTokenizedStream;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         let mut tokens = Vec::new();
-        let mut word_start = None;
-        for (offset, ch) in text.char_indices() {
-            if is_han(ch) {
-                if let Some(start) = word_start.take() {
-                    push_token(&mut tokens, text, start, offset);
-                }
-                push_token(&mut tokens, text, offset, offset + ch.len_utf8());
-            } else if ch.is_alphanumeric() {
-                word_start.get_or_insert(offset);
-            } else if let Some(start) = word_start.take() {
-                push_token(&mut tokens, text, start, offset);
+        for seg in self.jieba.cut(text, false) {
+            // 跳过空串与纯空白/标点（jieba 会把空格、顿号等单字切出）
+            let word = seg.word;
+            if word.is_empty() || word.chars().all(|c| !c.is_alphanumeric() && !is_han(c)) {
+                continue;
             }
+            // 用 jieba 返回的字节偏移，重复词也不会错位（比 text.find(word) 可靠）
+            tokens.push(Token {
+                offset_from: seg.byte_start,
+                offset_to: seg.byte_end,
+                position: tokens.len(),
+                position_length: 1,
+                text: word.to_owned(),
+            });
         }
-        if let Some(start) = word_start {
-            push_token(&mut tokens, text, start, text.len());
-        }
-        PreTokenizedString {
-            text: text.to_owned(),
-            tokens,
-        }
-        .into()
+        PreTokenizedString { text: text.to_owned(), tokens }.into()
     }
-}
-
-fn push_token(tokens: &mut Vec<Token>, text: &str, from: usize, to: usize) {
-    tokens.push(Token {
-        offset_from: from,
-        offset_to: to,
-        position: tokens.len(),
-        position_length: 1,
-        text: text[from..to].to_owned(),
-    });
 }
 
 fn is_han(ch: char) -> bool {
@@ -422,6 +457,7 @@ mod tests {
             doc_type: "ec_block".to_string(),
             title: title.to_string(),
             summary: summary.to_string(),
+            raw_body: String::new(),
             doc_text: String::new(),
             path: "/s.jsonl".to_string(),
             start_line: 1,
@@ -479,13 +515,55 @@ mod tests {
 
     #[test]
     fn cjk_tokenizer_splits_han() {
-        use tantivy::tokenizer::TokenStream;
-        let mut analyzer = TextAnalyzer::builder(CjkUnigramTokenizer)
-            .filter(LowerCaser)
-            .build();
-        let mut stream = analyzer.token_stream("EC上下文");
+        use tantivy::tokenizer::{LowerCaser, TokenStream};
+        let mut analyzer = TextAnalyzer::builder(JiebaTokenizer {
+            jieba: jieba(),
+        })
+        .filter(LowerCaser)
+        .build();
+        let mut stream = analyzer.token_stream("EC上下文管理");
         let mut tokens = Vec::new();
         stream.process(&mut |t| tokens.push(t.text.clone()));
-        assert_eq!(tokens, vec!["ec", "上", "下", "文"]);
+        // jieba 语义分词：英文整词 + 中文成词（非逐字）
+        assert_eq!(tokens, vec!["ec", "上下文", "管理"]);
+    }
+
+    #[test]
+    fn raw_body_searchable_before_catchup() {
+        // 评审 #6：修正前 index_session 首建 title/summary 为空，catchup 前全文查不到。
+        // 现在 raw_body 合流原文，即使 ec 未追上也应能被关键词命中。
+        let (idx, dir) = tmp_index();
+        let mut d = doc("s1", "m1", "", ""); // title/summary 空 = 未追赶
+        d.raw_body = "user: 帮我连接 gh-proxy 加速
+assistant: 已用 gh-proxy 测速".to_string();
+        index_block(&idx, &d).unwrap();
+
+        // 关键词命中 raw_body（标题/摘要为空也能按原文检索）
+        let hits = search(&idx, "s1", "ec_block", "gh-proxy", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+        // raw_body 只索引不 STORED：读不回原文（权威在 JSONL），由 recall 层按行号回读
+        assert!(hits[0].doc_text.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_raw_text_includes_tool_calls() {
+        use crate::ec::types::{MessageRecord, ToolCallFunction, ToolCallRecord};
+        let r = MessageRecord {
+            id: "m".into(), parent_id: None, role: "assistant".into(),
+            timestamp: None, model: None, channel: None, thinking: None, reasoning_effort: None,
+            usage: None, stop_reason: None, reasoning: None, duration_ms: None,
+            content: String::new(),
+            tool_calls: vec![ToolCallRecord {
+                id: "c1".into(), type_: "function".into(),
+                function: ToolCallFunction { name: "bash".into(), arguments: "{cmd:ls}".into() },
+            }],
+            tool_call_id: None, tool_name: None, name: None, ec: None,
+        };
+        let text = record_raw_text(&r);
+        assert!(text.contains("assistant: "));
+        assert!(text.contains("tool bash"));
+        assert!(text.contains("{cmd:ls}"));
     }
 }

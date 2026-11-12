@@ -196,37 +196,6 @@ pub fn to_record(m: &ChatMessage, parent_id: Option<&str>) -> MessageRecord {
     }
 }
 
-/// 构造 tool_result 记录（带工具名）。
-pub fn tool_record(
-    tool_call_id: &str,
-    tool_name: &str,
-    content: &str,
-    parent_id: Option<&str>,
-) -> MessageRecord {
-    let ft = format!("tool_result:{}:{}", tool_call_id, content);
-    let id = message_id(&ft, parent_id);
-    MessageRecord {
-        id,
-        parent_id: parent_id.map(|s| s.to_string()),
-        role: "tool_result".to_string(),
-        timestamp: None,
-        model: None,
-        channel: None,
-        thinking: None,
-        reasoning_effort: None,
-        usage: None,
-        stop_reason: None,
-        reasoning: None,
-        duration_ms: None,
-        content: content.to_string(),
-        tool_calls: vec![],
-        tool_call_id: Some(tool_call_id.to_string()),
-        tool_name: Some(tool_name.to_string()),
-        name: None,
-        ec: None,
-    }
-}
-
 fn sha16(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);

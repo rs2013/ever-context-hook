@@ -16,7 +16,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process;
 
 /// 锁文件超过此秒数视为过期（进程被强杀后的兜底）。
 const STALE_SECS: u64 = 1800; // 30 min

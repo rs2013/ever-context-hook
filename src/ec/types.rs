@@ -108,18 +108,6 @@ pub enum BlockState {
     Omitted = 3,
 }
 
-impl BlockState {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "raw" => Some(Self::Raw),
-            "summary" => Some(Self::Summary),
-            "index_only" => Some(Self::IndexOnly),
-            "omitted" => Some(Self::Omitted),
-            _ => None,
-        }
-    }
-}
-
 // ── OpenAI 请求消息（从 params.request.messages 解析） ──
 
 /// OpenAI Chat 消息（入站解析用）。
@@ -213,12 +201,8 @@ pub struct DerivedBudget {
     pub highlights_budget: u32,
     /// 摘要区 token 预算 = round(softThreshold × 0.30)。
     pub summary_budget: u32,
-    /// 原文区预算 = softThreshold − 三区。
-    pub raw_budget: u32,
     /// 单块目标 token（10K，可被 EcConfig.target_tokens 覆盖）。
     pub target_tokens: u32,
-    /// 过度合并护栏（80K）。
-    pub max_block_tokens: u32,
 }
 
 impl DerivedBudget {
@@ -235,10 +219,6 @@ impl DerivedBudget {
         let directory_budget = 3_000;
         let highlights_budget = 5_000;
         let summary_budget = (soft_threshold as f64 * 0.30).round() as u32;
-        let raw_budget = soft_threshold
-            .saturating_sub(directory_budget)
-            .saturating_sub(highlights_budget)
-            .saturating_sub(summary_budget);
         let degrade_target = (soft_threshold as f64 * degrade_target_ratio).round() as u32;
         Self {
             reserve_tokens: ((context_window as f64 * 0.10).round() as u32).max(16_384),
@@ -248,9 +228,7 @@ impl DerivedBudget {
             directory_budget,
             highlights_budget,
             summary_budget,
-            raw_budget,
             target_tokens: 10_000,
-            max_block_tokens: 80_000,
         }
     }
 }

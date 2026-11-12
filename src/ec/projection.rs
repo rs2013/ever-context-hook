@@ -146,15 +146,6 @@ pub fn estimate_management_tokens(chain: &[MessageRecord], budget: &WindowConfig
     (text.len() as f64 / 3.0).ceil() as u32
 }
 
-/// 投影尾部提示（每轮变化，放末尾天然不破坏前缀缓存）。
-///
-/// 内容 = 当前叶子（最后一条原生消息的 parent_id），供 recall CLI 定位。
-/// 实际上定位文件已经承载了叶子信息（见 store.rs update_leaf），
-/// 这里返回的提示仅用于 LLM 可读的说明（当前实现可不注入，保留接口）。
-pub fn leaf_hint(leaf_id: &str) -> String {
-    format!("leaf={leaf_id}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

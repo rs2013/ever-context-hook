@@ -21,6 +21,12 @@ pub struct RecallHit {
     pub block_id: String,
     pub title: String,
     pub summary: String,
+    /// 命中段原文（verbatim JSONL 行，回读自 path/start_line/end_line）。
+    /// 未回读（降级路径、目录/精华召回）时为空。
+    pub raw: String,
+    /// 命中段在 JSONL 的行区间（原文回读来源）。
+    pub start_line: u64,
+    pub end_line: u64,
     pub score: f32,
 }
 
@@ -61,9 +67,12 @@ pub fn search(session_id: &str, query: &str, limit: usize, data_root: &str) -> V
                     let rec = chain.iter().find(|r| r.id == h.message_id)?;
                     let ec = rec.ec.as_ref()?;
                     Some(RecallHit {
-                        block_id: h.message_id,
+                        block_id: h.message_id.clone(),
                         title: if ec.title.is_empty() { "(无标题)".to_string() } else { ec.title.clone() },
                         summary: ec.summary.clone(),
+                        raw: read_raw_block(&store, &h),
+                        start_line: h.start_line,
+                        end_line: h.end_line,
                         score: h.score,
                     })
                 })
@@ -102,6 +111,9 @@ pub fn directory(session_id: &str, data_root: &str) -> Vec<RecallHit> {
             block_id: id,
             title: if ec.title.is_empty() { "(无标题)".to_string() } else { ec.title.clone() },
             summary: String::new(),
+            raw: String::new(),
+            start_line: 0,
+            end_line: 0,
             score: 0.0,
         })
         .collect()
@@ -157,6 +169,9 @@ pub fn search_knowledge(query: &str, limit: usize, data_root: &str) -> Vec<Recal
                 block_id: if h.doc_key.is_empty() { h.message_id } else { h.doc_key },
                 title: if title.is_empty() { "(无标题)".to_string() } else { title },
                 summary,
+                raw: String::new(),
+                start_line: 0,
+                end_line: 0,
                 score: h.score,
             }
         })
@@ -178,6 +193,9 @@ pub fn search_chain(chain: &[crate::ec::types::MessageRecord], query: &str, limi
                     block_id: rec.id.clone(),
                     title: if ec.title.is_empty() { "(无标题)".to_string() } else { ec.title.clone() },
                     summary: text,
+                    raw: String::new(),
+                    start_line: 0,
+                    end_line: 0,
                     score,
                 });
             }
@@ -211,13 +229,16 @@ fn score_text(text: &str, query: &str) -> f32 {
     char_ratio + word_hits as f32 * 0.1
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().take(max_chars).collect();
-    let mut out: String = chars.into_iter().collect();
-    if s.chars().count() > max_chars {
-        out.push('…');
+/// 按 path/start_line/end_line 回读命中段的 JSONL 原文（verbatim）。
+/// 读失败（文件不存在/行越界）时返回空串，不影响召回主流程。
+fn read_raw_block(store: &Store, h: &crate::ec::index::SearchHit) -> String {
+    if h.path.is_empty() || h.end_line == 0 {
+        return String::new();
     }
-    out
+    match store.read_lines_range(&h.path, h.start_line, h.end_line) {
+        Ok(lines) => lines.join("\n"),
+        Err(_) => String::new(),
+    }
 }
 
 /// 格式化命中为 CLI 输出文本。
@@ -232,7 +253,12 @@ pub fn format_hits(hits: &[RecallHit]) -> String {
     let mut out = String::from("[EC_RECALL_RESULT]\n");
     out.push_str(&format!("找到 {} 条相关上下文：\n\n", hits.len()));
     for (i, h) in hits.iter().enumerate() {
-        out.push_str(&format!("[{}] ### {} ({})\n{}\n\n", i + 1, h.title, h.block_id, h.summary));
+        out.push_str(&format!("[{}] ### {} ({})\n{}", i + 1, h.title, h.block_id, h.summary));
+        if !h.raw.is_empty() {
+            // 命中段原文回读注入，供 LLM 精确检索历史工具参数/错误/用户约束
+            out.push_str(&format!("\n--- 原文 (行 {}-{})\n{}", h.start_line, h.end_line, h.raw));
+        }
+        out.push_str("\n\n");
     }
     out.push_str("[/EC_RECALL_RESULT]");
     out

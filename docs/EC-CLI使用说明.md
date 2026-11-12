@@ -1,0 +1,336 @@
+# EC 工具 CLI 使用说明（ever-context-hook）
+
+> 适用版本：`Cargo.toml` 0.1.0 / `manifest` 声明 0.2.0（产物：`target/release/ever-context-hook.exe`）
+> 本文以源码为准（`src/main.rs`、`src/rpc.rs`、`src/hook.rs`、`src/ec/recall.rs`、`src/ec/catchup.rs`），非设计稿。
+
+---
+
+## 0. 结论先行：它是不是"符合 ww3 hook 契约的 EC 工具"
+
+**是。** 它就是一个单文件二进制，同时承担两件事：
+
+| 身份 | 入口 | 谁调用 |
+| --- | --- | --- |
+| **ww3 Hook 插件**（主身份） | `ever-context-hook call --data <插件数据目录>`（`call` 可省略，默认就是它） | ww3-core 每请求 spawn 一次，走 stdin/stdout 的 JSONL RPC |
+| **辅助 CLI**（同一二进制） | `manifest` / `recall` / `catchup` / `ping` | 人工、LLM 通过 bash、或 hook 自己 detach 子进程 |
+
+**`--help` 报"未知命令"是预期行为**：本工具没有实现 `--help` / `-h` / `--version`，也没有 `clap` 之类的参数解析。任何未列出的第一个参数都会走：
+
+```
+未知命令: <x>
+exit 2
+```
+
+要看版本请用 `ever-context-hook manifest | jq -r .version`。
+
+### 契约符合度（精确表述）
+
+| 契约项 | 状态 |
+| --- | --- |
+| `manifest` 声明 `kind=hook`、`execution.control/conversation="call"`、`protocol 1..1` | ✅ 已实现 |
+| RPC 方法 `request.prepare`（一次性，返回改写后的 request） | ✅ 已实现 |
+| RPC 方法 `hook.stream`（双向流，透传事件 + 落盘响应） | ✅ 已实现 |
+| manifest 声明的 control 能力 `config.schema` / `config.get` / `ping` / `health.check` | ❌ **RPC 层未实现**（只有 `ping` 有本地子命令，RPC 调用会返回"未知方法"并 exit 1） |
+| `--help` / `--version` | ❌ 未实现 |
+
+也就是说：**hook 的两个核心方法齐了，control 面的四个方法只是 manifest 里写了、代码里没接**。如果 ww3 启动时会调 `config.get` 做健康检查，需要确认它的失败容忍策略。
+
+---
+
+## 1. 全局约定
+
+### 1.1 全局参数
+
+| 参数 | 作用域 | 说明 |
+| --- | --- | --- |
+| `--data <dir>` | **所有子命令**（在 dispatch 之前解析） | 设置插件数据目录。**仅当环境变量 `EC_DATA_ROOT` 未设置时**才写入 `EC_DATA_ROOT`（不覆盖显式环境变量） |
+
+### 1.2 环境变量
+
+| 变量 | 用途 | 默认 |
+| --- | --- | --- |
+| `EC_DATA_ROOT` | 数据根目录（JSONL + 索引） | 回退 `WW3_DATA`，再回退 `.` |
+| `WW3_DATA` | 同上，ww3 风格命名 | `.` |
+| `EC_CATCHUP_CONFIG` | 只有 `catchup` 用：`{"model":"...","thinking":false}` 的 JSON，作为 `--model/--thinking` 的兜底 | 无 |
+| `WW3_CORE_EXE` | hook 自动 spawn 追赶时用：ww3-core 可执行文件 | `ww3-core` |
+| `WW3_CORE_DATA` | hook 自动 spawn 追赶时用：core 数据目录 | `<data_root>/../../` |
+| `WW3_PLUGINS_DIR` | hook 自动 spawn 追赶时用：插件目录 | `<data_root>/../` |
+| `RUST_LOG` | 日志级别（env_logger），日志一律走 **stderr** | `info` |
+
+> 日志与诊断信息全部写 stderr，**stdout 只承载 RPC 帧或命令正文**，可安全管道。
+
+### 1.3 退出码
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1 | 运行期失败（RPC 处理失败、索引/IO 错误、manifest 写失败、catchup 失败） |
+| 2 | 用法错误（未知命令、缺必填参数、`--thinking`/`--summary-mode` 取值非法） |
+
+### 1.4 数据布局
+
+```
+<EC_DATA_ROOT>/
+├── sessions/
+│   ├── <session_id>.jsonl         # 权威数据：消息树（id + parent_id + ec 投影）
+│   ├── <session_id>.leaf          # 当前叶子指针
+│   ├── <session_id>.jsonl.lock    # JSONL 写锁（短持锁）
+│   └── <session_id>.lock          # catchup 会话锁（长持锁，30min 过期）
+├── index/                         # 内嵌 Tantivy（派生缓存，可从 JSONL 重建）
+└── ...
+```
+
+`session_id` = 首条 user 锚定区（首个 assistant 之前的全部 user 内容）的 SHA256 前 16 hex，**由 EC 自己算，不依赖下游 Agent 的 conversation_id**。
+
+---
+
+## 2. `call`（默认）— ww3 Hook 入口
+
+```
+ever-context-hook [call|stdio] [--data <插件数据目录>]
+```
+
+`call` 与 `stdio` 完全等价。**不带任何子命令时默认就是 `call`**，所以 ww3 侧配置 `execution=call` + 参数 `["--data", "<dir>"]` 即可。
+
+### 2.1 帧格式（每行一个 JSON）
+
+```jsonc
+// core → hook：握手，必须是第一帧
+{"v":1,"id":"req-1","op":"invoke","method":"hook.stream","params":{...}}
+
+// core → hook：逐事件推入（仅 hook.stream）
+{"v":1,"id":"req-1","op":"push","event":"text.delta","data":{"content":"..."}}
+
+// hook → core：处理后的事件（可改写/丢弃/合并）
+{"v":1,"id":"req-1","op":"event","event":"text.delta","data":{"content":"..."}}
+
+// hook → core：结束
+{"v":1,"id":"req-1","op":"result","ok":true}
+```
+
+`invoke.method` 只认两个值，其他一律 `未知方法: <m>` + exit 1：
+
+| method | 语义 | 返回 |
+| --- | --- | --- |
+| `request.prepare` | **一次性**：改写入站请求（落盘增量 + 注入管理区 + 硬预算降级 + 注入工具定义） | `result` 帧，`result = {"request": <改写后的完整请求>}` |
+| `hook.stream` | **双向流**：透传上游事件，收集 assistant 回复并在 `upstream.end` 后落盘 | `result` 帧，`ok=true/false` |
+
+### 2.2 `request.prepare` 示例
+
+```bash
+echo '{"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{}}' >/dev/null  # 仅示意
+
+echo '{"v":1,"id":"r1","op":"invoke","method":"request.prepare","params":{
+  "hook_id":"ec-1",
+  "chain":{"index":0,"total":1},
+  "config":{"enabled":true},
+  "request":{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"你好"}]}
+}}' | ./ever-context-hook call --data ./e2e/data/core/plugins/ever-context
+```
+
+预期 stdout（单行）：
+
+```json
+{"v":1,"id":"r1","op":"result","ok":true,"result":{"request":{"model":"deepseek-v4-pro","messages":[...],"tools":[...]}}}
+```
+
+失败时（**注意**）：`errkind` 硬编码为 `prompt_too_long`、scope `request`、exit 1，即使真实原因是"缺 request 字段"。
+
+### 2.3 `hook.stream` 示例
+
+```bash
+printf '%s\n%s\n%s\n' \
+ '{"v":1,"id":"r2","op":"invoke","method":"hook.stream","params":{"request":{"model":"m","messages":[]},"config":{}}}' \
+ '{"v":1,"id":"r2","op":"push","event":"text.delta","data":{"content":"回答"}}' \
+ '{"v":1,"id":"r2","op":"push","event":"upstream.end","data":{"ok":true}}' \
+ | ./ever-context-hook call
+```
+
+识别并特殊处理的事件：
+
+| 事件 | hook 行为 |
+| --- | --- |
+| `text.delta` | 累积正文 → 透传 |
+| `reasoning.delta` | 累积思考内容 → 透传 |
+| `tool_call.delta` | 按 `index` 聚合 tool_calls（`id`/`type`/`name`/`arguments_fragment`）→ 透传 |
+| `usage` | 记录 `prompt_tokens`/`completion_tokens` → 透传 |
+| `finish_reason` | 记录 `reason` → 透传 |
+| `upstream.end` / `upstream.done` | 结束信号，**不转发**，`ok` 决定是否落盘 |
+| 其他任意事件 | 原样透传 |
+
+落盘条件：`exit_code==0 && upstream_ok && 正文/工具调用/思考非空`。落盘内容 = assistant 记录（含 model/channel/thinking/usage/stop_reason/reasoning/duration_ms）+ 更新 `.leaf`。
+
+---
+
+## 3. `manifest`
+
+```
+ever-context-hook manifest [--out <path>]
+```
+
+- 无 `--out`：pretty JSON 打到 stdout。
+- 有 `--out`：写文件；写失败 exit 1。
+
+```bash
+ever-context-hook manifest --out ./e2e/plugins/ever-context/0.1.0/manifest.json
+```
+
+manifest 关键字段：`id=ever-context`、`kind=hook`、`version=0.2.0`、`execution.control/conversation=call`、`max_workers=8`、`capabilities.conversation=[hook.stream, request.prepare]`。
+
+---
+
+## 4. `recall` — 不调 LLM 的直接检索（LLM 通过 bash 调用）
+
+```
+ever-context-hook recall --session <id> [--query <q>] [--limit <n>]
+ever-context-hook recall --directory  --session <id>
+ever-context-hook recall --highlights --session <id>
+ever-context-hook recall --knowledge --query <q> [--limit <n>]
+ever-context-hook recall --add-knowledge --title <t> --summary <s>
+```
+
+**模式优先级（从高到低，命中即返回）**：`--add-knowledge` → `--knowledge` → `--directory` → `--highlights` → 默认检索。
+
+| 参数 | 适用模式 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--session <id>` | 默认 / `--directory` / `--highlights` | 是 | — | 缺则 exit 2 并打印用法 |
+| `--query <q>` | 默认 / `--knowledge` | 默认模式可空；`--knowledge` 必填 | `""` | 关键词（Tantivy 检索时与索引同一 jieba 分词） |
+| `--limit <n>` | 默认 / `--knowledge` | 否 | `5` | 返回条数上限 |
+| `--title` / `--summary` | `--add-knowledge` | 是 | — | 缺任一 exit 2 |
+
+### 4.1 各模式行为
+
+| 模式 | 输出（stdout） | 数据来源 |
+| --- | --- | --- |
+| 默认检索 | `[EC_RECALL_RESULT]` … `[/EC_RECALL_RESULT]`，每条含 `### 标题 (block_id)` + 摘要 + `--- 原文 (行 a-b)` + **JSONL 原文 verbatim** | Tantivy 召回 → 按 `path/start_line/end_line` 回读 JSONL；索引不可用时退化为内存 `search_chain` |
+| `--directory` | `[EC_DIRECTORY]` + 每行 `<block_id> <title>` | 祖先链上全部压缩块（不受目录预算裁剪） |
+| `--highlights` | `[EC_HIGHLIGHTS]` + 每行 `- <highlight>` | 祖先链上全部块 highlights 合并去重 |
+| `--knowledge` | 同 `[EC_RECALL_RESULT]` | 全局 `doc_type=knowledge`（不受 session 限制） |
+| `--add-knowledge` | `已写入知识：<title>` | 写索引 `doc_key=knowledge:<sha8(title)>` |
+
+无命中时输出人类可读提示：`未找到相关历史内容。` / `本会话暂无压缩块。` / `本会话暂无精华内容。`
+
+### 4.2 示例
+
+```bash
+# 本会话关键词召回（含原文回读）
+ever-context-hook recall --session 3f2a9c1b7d4e5061 --query "接口超时" --limit 3
+
+# 完整目录 / 完整精华
+ever-context-hook recall --session 3f2a9c1b7d4e5061 --directory
+ever-context-hook recall --session 3f2a9c1b7d4e5061 --highlights
+
+# 跨会话知识
+ever-context-hook recall --knowledge --query "部署口令"
+ever-context-hook recall --add-knowledge --title "ww3 端口" --summary "core 默认监听 127.0.0.1:7864"
+```
+
+> `--data` 也可用（全局参数），等价于提前设置 `EC_DATA_ROOT`。
+
+---
+
+## 5. `catchup` — 旧对话离线追赶（后台逐段调 LLM 补摘要）
+
+```
+ever-context-hook catchup --session <id> --core-data <core数据目录>
+                          [--data <插件数据目录>] [--core <core可执行文件>] [--plugins <插件目录>]
+                          [--model <模型>] [--thinking true|false]
+                          [--target-tokens <n>] [--gap-ms <n>]
+                          [--summary-mode fragment|full_context] [--full-context-max-tokens <n>]
+                          [--trace <trace.jsonl>]
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `--session <id>` | ✅ | — | 目标会话 |
+| `--core-data <dir>` | ✅ | — | core 数据目录（缺则 exit 2） |
+| `--data <dir>` | 否 | `EC_DATA_ROOT` | EC 数据目录 |
+| `--core <path>` | 否 | `ww3-core` | core 可执行文件，内部以 `stdio --data <core-data> --plugins <plugins> --hooks none` 启动 |
+| `--plugins <dir>` | 否 | `""` | 透传给 core |
+| `--model <m>` | 否* | 见下 | 摘要模型 |
+| `--thinking <bool>` | 否 | 见下 | 摘要请求是否开思考 |
+| `--target-tokens <n>` | 否 | `10000` | 单块目标 token |
+| `--gap-ms <n>` | 否 | `200` | 每块之间的节流间隔 |
+| `--summary-mode <m>` | 否 | `full_context` | `fragment` \| `full_context`（`full_context` 提供完整前缀 + 唯一锚点，吃上游前缀缓存） |
+| `--full-context-max-tokens <n>` | 否 | `60000` | full_context 前缀上限，超了自动退 fragment |
+| `--trace <path>` | 否 | 无 | 每块决策/耗时写 JSONL 追踪 |
+
+`--model` / `--thinking` 的兜底顺序：
+
+```
+--model        → EC_CATCHUP_CONFIG.model  → 会话最后一条 assistant 的 model    → 报错"缺少摘要模型"
+--thinking     → --thinking 显式值        → EC_CATCHUP_CONFIG.thinking        → 最后一条 assistant 的 thinking → false
+```
+
+示例：
+
+```bash
+ever-context-hook catchup \
+  --session 3f2a9c1b7d4e5061 \
+  --data ./e2e/data/core/plugins/ever-context \
+  --core ./e2e/ww3-core.exe \
+  --core-data ./e2e/data/core \
+  --plugins ./e2e/data/core/plugins \
+  --model deepseek-v4-pro --thinking false \
+  --summary-mode full_context --trace ./temp/catchup-trace.jsonl
+```
+
+> **谁会自动调它**：`request.prepare` 发现「未摘要 token ≥ target_tokens 且投影 > 软阈值」时，会用 `compact` 配置 detach 一个本命令的子进程（`--data/--core/--core-data/--plugins` 由 `WW3_*` 环境变量或 data_root 反推）。手工追赶才需要显式传参。
+
+---
+
+## 6. `ping`
+
+```
+ever-context-hook ping
+```
+
+向 **stderr** 打 `[ec-hook] ping: ok`，exit 0。仅自检用；RPC 层的 `ping` 方法未实现。
+
+---
+
+## 7. 插件配置（`hooks[].config`，由 ww3 下发）
+
+`EcConfig` 实际接受的键（`serde` 默认忽略未知键，写错不报错）：
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | `false` 时 `hook.stream` 纯透传 |
+| `context_window` | u32 | `0` | `>0` 时覆盖按模型名推断的窗口 |
+| `hard_budget` | u32 | `0` | `>0` 时覆盖硬预算线 |
+| `soft_threshold` | u32 | `0` | `>0` 时覆盖软阈值 |
+| `degrade_target_ratio` | f64 | `0.6` | 硬线降级目标 = 软阈值 × 该比例（非 0.6 时重算整份预算） |
+| `target_tokens` | u32 | `10000` | 单块目标 token |
+| `compact.model` / `compact.thinking` | string/bool | 空 | **正常对话增量压缩**；模型缺省取本轮 `request.model`，thinking 缺省跟随请求 |
+| `catchup.model` / `catchup.thinking` | string/bool | 空 | 旧对话追赶（**尚未接线**，见下） |
+| `fail_open` | bool | `false` | 观测/门模式开关（**尚未接线**） |
+
+> ⚠️ 旧配置里的 `growth_nudge`、`pressure_threshold` 已在死代码清理中移除（对应 `compress::decide` 链路），保留在 JSON 里不会报错但**不再生效**。`e2e/data/config.json` 里仍有这两个键，可一并删除。
+> ⚠️ `catchup.*` 与 `fail_open` 目前是「配置项存在但不生效」：自动 spawn 一律用 `compact` 模型；手工追赶用 CLI `--model`。这是已知待接线缺口。
+
+---
+
+## 8. 已知限制清单（按影响排序）
+
+1. `--help` / `-h` / `--version` 未实现，未知命令 exit 2。
+2. manifest 声明了 `config.schema` / `config.get` / `ping` / `health.check` 四个 control 能力，**RPC 层未实现**。
+3. `request.prepare` 的任何失败都被报成 `errkind=prompt_too_long`（硬编码）。
+4. `catchup.*` 插件配置、`fail_open` 尚未接线。
+5. `recall` 不调 LLM；RAG（`rag.model` + 生成式回答）只有设计，未实现，因此没有 `rag` 子命令。
+6. `catchup` 四态推进目前用 `WindowConfig::default()`，不随实际模型窗口变化。
+7. 并发写保护：`append`/`import_messages`/`update_leaf` 仍未纳入同一把会话写锁（评审 P0 项，未修）。
+8. `core_client` 无请求超时；锁 30 分钟过期且无心跳。
+
+---
+
+## 9. 与你预期核对用的自检清单
+
+- [ ] 二进制路径 `target/release/ever-context-hook.exe`，ww3 侧只需 `["call","--data","<插件数据目录>"]`
+- [ ] 两个 RPC 方法：`request.prepare`（结果在 `result.request`）、`hook.stream`（透传 + 落盘）
+- [ ] 五个子命令：`call`(默认) / `manifest` / `recall` / `catchup` / `ping`
+- [ ] `recall` 五模式与优先级：`--add-knowledge` > `--knowledge` > `--directory` > `--highlights` > 默认
+- [ ] `recall` 默认与 `--knowledge` 需要 `--query`；`--directory`/`--highlights`/默认 需要 `--session`
+- [ ] `catchup` 必填 `--session` + `--core-data`，模型兜底链三段
+- [ ] 退出码 0/1/2 语义
+- [ ] stdout 只出 RPC 帧或正文，日志全在 stderr
+- [ ] 数据落在 `<EC_DATA_ROOT>/sessions/<session_id>.jsonl` + `<EC_DATA_ROOT>/index/`

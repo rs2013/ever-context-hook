@@ -302,8 +302,5 @@ impl Stream {
 
 /// errkind 子集（与 ww3 共享，见 IPC_CHAT §4.1）
 pub mod errkind {
-    pub const PROMPT_TOO_LONG: &str = "prompt_too_long";
-    pub const REQUEST: &str = "request";
-    pub const MODEL: &str = "model";
     pub const CONN: &str = "conn";
 }

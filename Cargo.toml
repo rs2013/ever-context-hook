@@ -25,6 +25,9 @@ env_logger = "0.11"
 # 与 ec-index 同版本与特性，分词器（ec_cjk_unigram_v1）复用同一实现
 tantivy = { version = "=0.22.1", default-features = false, features = ["mmap", "lz4-compression"] }
 
+# 中文语义分词：替换自研 unigram 分词器（ref/jieba-probe 验证：连续短语匹配大幅提升检索精确率，长文本性能快于 unigram）
+jieba-rs = "0.11"
+
 [profile.release]
 lto = true
 codegen-units = 1
